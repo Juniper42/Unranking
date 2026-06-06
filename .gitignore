@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+.Python
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Datasets & model caches (regenerated locally)
+data/*
+!data/.gitkeep
+model_cache/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+# Logs and experiment outputs
+logs/
+*.log
+output/
+results/
+*.csv
+
+# Manuscript (kept out of the public code repo on purpose)
+*.tex
+*.aux
+*.bbl
+*.blg
+*.pdf
