@@ -20,7 +20,7 @@ def get_model(args, num_users, num_items):
     """
     backbone = args.get("backbone", "lightgcn")
     emb_dim = args.get("emb_dim", 64)
-    num_layers = args.get("num_layers", 2)
+    num_layers = args.get("num_layers", 3)
     dropout_rate = args.get("dropout_rate", 0.0)
 
     if backbone == "lightgcn":

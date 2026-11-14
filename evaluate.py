@@ -1,9 +1,5 @@
-import gc
-import time
-
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from logger import Logger
 from utils import determine_is_gnn
@@ -74,7 +70,9 @@ def evaluate_model(
 
     if is_gnn_model:
         graph_edge_index = getattr(
-            data, "train_edge_index_after_remove", data.train_edge_index
+            data,
+            "eval_edge_index",
+            getattr(data, "train_edge_index_after_remove", data.train_edge_index),
         )
         user_emb, item_emb = model(edge_index=graph_edge_index.to(device))
     elif is_neumf:
@@ -82,23 +80,24 @@ def evaluate_model(
     else:
         user_emb, item_emb = model.get_embeddings()
 
-    # Create a mask for training interactions to exclude them from recommendations
-    train_mask = torch.zeros(
-        (data.num_users, data.num_items), dtype=torch.bool, device=device
-    )
+    # Sparse per-user masks of seen training items.  A dense
+    # num_users x num_items mask is infeasible on Netflix
+    # (480,189 x 177,770), so the mask is applied row by row.
+    train_items_by_user = {}
     if user_train_items is not None:
         for user_id, item_ids in user_train_items.items():
             if 0 <= user_id < data.num_users and item_ids:
-                item_tensor = torch.tensor(
-                    list(item_ids), dtype=torch.long, device=device
+                items = torch.tensor(
+                    sorted(item_ids), dtype=torch.long, device=device
                 )
-                item_tensor = item_tensor[
-                    (0 <= item_tensor) & (item_tensor < data.num_items)
-                ]
-                train_mask[user_id, item_tensor] = True
-    elif hasattr(data, 'train_ratings') and not data.train_ratings.empty:
-        train_pairs = torch.tensor(data.train_ratings[['user_idx', 'item_idx']].values, device=device)
-        train_mask[train_pairs[:, 0], train_pairs[:, 1]] = True
+                items = items[(0 <= items) & (items < data.num_items)]
+                train_items_by_user[user_id] = items
+    elif hasattr(data, "train_ratings") and not data.train_ratings.empty:
+        grouped = data.train_ratings.groupby("user_idx")["item_idx"].apply(list)
+        for user_id, item_ids in grouped.items():
+            train_items_by_user[int(user_id)] = torch.tensor(
+                sorted(item_ids), dtype=torch.long, device=device
+            )
 
     # Prepare ground truth dictionary for evaluation users
     eval_users = eval_edge_index[0]
@@ -133,8 +132,11 @@ def evaluate_model(
             batch_user_emb = user_emb[batch_user_ids]
             scores_batch = torch.matmul(batch_user_emb, item_emb.t())
 
-        # Apply training mask
-        scores_batch.masked_fill_(train_mask[batch_user_ids], float("-inf"))
+        # Apply the sparse seen-item mask.
+        for row, user_id in enumerate(batch_user_ids.tolist()):
+            seen = train_items_by_user.get(user_id)
+            if seen is not None and seen.numel() > 0:
+                scores_batch[row, seen] = float("-inf")
 
         _, topk_indices = torch.topk(scores_batch, k=k, dim=1)
         
@@ -182,8 +184,12 @@ def evaluate_model(
             pos_items = ground_truth[user_id.item()]
             user_scores = scores_batch[i]
             pos_scores = user_scores[pos_items]
-            all_neg_items = torch.ones(data.num_items, dtype=torch.bool, device=device)
-            all_neg_items[train_mask[user_id]] = False
+            all_neg_items = torch.ones(
+                data.num_items, dtype=torch.bool, device=device
+            )
+            seen = train_items_by_user.get(user_id.item())
+            if seen is not None and seen.numel() > 0:
+                all_neg_items[seen] = False
             all_neg_items[pos_items] = False
             neg_scores = user_scores[all_neg_items]
             

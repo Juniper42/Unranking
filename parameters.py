@@ -20,20 +20,23 @@ class Config:
     def get_config():
         """Gets the command-line argument configuration."""
         parser = argparse.ArgumentParser(
-            description="Comparative Experiments of Unlearning Methods in Recommender Systems"
+            description=(
+                "Fast Unranking for Preference Revision in Recommendation: "
+                "Unranking and unlearning baselines."
+            )
         )
 
         # Core Parameters
         parser.add_argument(
             "--method",
             type=str,
-            default="retrain",
+            default="unranking",
             choices=[
                 "retrain",
+                "postfilter",
                 "gsgcf-ru",
                 "receraser",
                 "unranking",
-                "raru",
                 "ifru",
                 "sisa",
                 "certified_removal",
@@ -42,14 +45,17 @@ class Config:
                 "rrl",
                 "unlearnrec",
             ],
-            help="Unlearning method to use.",
+            help=(
+                "Revision method or baseline. 'postfilter' is the "
+                "Post-filtering reference point of the paper."
+            ),
         )
         parser.add_argument(
             "--dataset",
             type=str,
             default="ml-1m",
             choices=["ml-1m", "yelp2018", "amazon-book", "ml-10m", "netflix"],
-            help="Dataset to use.",
+            help="One of the five datasets used in the paper.",
         )
         parser.add_argument(
             "--backbone",
@@ -66,25 +72,58 @@ class Config:
                 "gcn",
                 "gin",
             ],
-            help="Backbone model for recommendations.",
+            help=(
+                "Recommendation backbone. The paper evaluates LightGCN, WMF, "
+                "and NeuMF; other choices are kept for compatibility."
+            ),
         )
         parser.add_argument(
             "--is_attack",
             type=str2bool,
             default=True,
-            help="Whether to perform a Membership Inference Attack.",
+            help=(
+                "Whether to train the membership-inference probe used to "
+                "compute the Revision Rate (RR)."
+            ),
+        )
+        parser.add_argument(
+            "--evaluate_rdr",
+            dest="evaluate_rdr",
+            type=str2bool,
+            default=True,
+            help="Whether to compute the Ranking Decrease Rate (RDR).",
         )
         parser.add_argument(
             "--evaluate_forgetting",
+            dest="evaluate_rdr",
             type=str2bool,
             default=True,
-            help="Whether to evaluate the forgetting effect.",
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--split_method",
             type=str,
             default="temporal",
-            help="Dataset splitting method (e.g., temporal).",
+            choices=["temporal", "random"],
+            help=(
+                "Dataset split. The paper uses a chronological 8:1:1 split "
+                "('temporal')."
+            ),
+        )
+        parser.add_argument(
+            "--min_rating",
+            type=float,
+            default=4.0,
+            help=(
+                "Minimum rating kept as an implicit positive (paper: >= 4). "
+                "Ignored for implicit-only files such as total.txt."
+            ),
+        )
+        parser.add_argument(
+            "--core",
+            type=int,
+            default=10,
+            help="k-core filtering threshold (paper: 10-core).",
         )
         parser.add_argument(
             "--k", type=int, default=10, help="Size of the recommendation list (top-k)."
@@ -111,7 +150,13 @@ class Config:
             "--num_runs",
             type=int,
             default=10,
-            help="Number of experimental runs for averaging results.",
+            help="Number of independent runs (paper: results averaged over 10 runs).",
+        )
+        parser.add_argument(
+            "--random_seed",
+            type=int,
+            default=42,
+            help="Base random seed for the run and the MIA probe.",
         )
 
         # Training Parameters
@@ -131,7 +176,13 @@ class Config:
             "--num_layers", type=int, default=3, help="Number of GNN layers."
         )
         parser.add_argument(
-            "--dropout_rate", type=float, default=0.2, help="Dropout rate."
+            "--dropout_rate",
+            type=float,
+            default=0.0,
+            help=(
+                "Dropout rate. The paper does not use dropout for LightGCN or "
+                "WMF; NeuMF may override this value."
+            ),
         )
         parser.add_argument(
             "--weight_decay",
@@ -172,9 +223,15 @@ class Config:
         parser.add_argument(
             "--early_stop_metric",
             type=str,
-            default="recall@k",
+            default="ndcg@k",
             choices=["recall@k", "ndcg@k"],
-            help="Metric for early stopping.",
+            help="Metric for early stopping (paper reports NDCG@10).",
+        )
+        parser.add_argument(
+            "--min_delta",
+            type=float,
+            default=0.0,
+            help="Minimum improvement required by the early-stopping rule.",
         )
         parser.add_argument(
             "--scheduler_type",
@@ -221,45 +278,98 @@ class Config:
             help="Temperature parameter for InfoNCE loss.",
         )
 
-        # MIA Parameters
+        # MIA probe parameters (paper Section 5.1.6).
         parser.add_argument(
             "--attack_batch_size",
             type=int,
-            default=512,
-            help="Batch size for the attack model.",
+            default=256,
+            help="Batch size for the MIA probe (paper: 256).",
         )
         parser.add_argument(
             "--attack_epochs",
             type=int,
             default=100,
-            help="Number of training epochs for the attack model.",
+            help="Maximum training epochs for the MIA probe (paper: 100).",
         )
         parser.add_argument(
             "--attack_lr",
             type=float,
-            default=0.001,
-            help="Learning rate for the attack model.",
+            default=1e-3,
+            help="Adam learning rate for the MIA probe (paper: 1e-3).",
+        )
+        parser.add_argument(
+            "--attack_patience",
+            type=int,
+            default=10,
+            help="Early-stopping patience on validation AUROC (paper: 10).",
+        )
+        parser.add_argument(
+            "--attack_max_pairs",
+            type=int,
+            default=10000,
+            help=(
+                "Optional cap on the number of target pairs used by the MIA "
+                "probe. 0 disables the cap."
+            ),
+        )
+        parser.add_argument(
+            "--mia_popularity_bins",
+            type=int,
+            default=10,
+            help="Number of item-popularity groups for non-member matching.",
         )
 
-        # Unlearning Parameters
+        # Revision request parameters (paper Section 5.1.4).
         parser.add_argument(
-            "--unlearning_ratio",
+            "--revision_ratio",
+            dest="revision_ratio",
             type=float,
             default=0.1,
-            help="Proportion of users or items to be unlearned.",
+            help=(
+                "Revision ratio in {0.025, 0.05, 0.1, 0.2}; the default 10% "
+                "interaction-level setting is used in the paper."
+            ),
+        )
+        parser.add_argument(
+            "--unlearning_ratio",
+            dest="revision_ratio",
+            type=float,
+            default=0.1,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--revision_level",
+            dest="revision_level",
+            type=str,
+            default="interaction",
+            choices=["interaction", "entity", "item"],
+            help=(
+                "Preference-revision granularity: 'interaction' or 'entity' "
+                "('item' is a backward-compatible alias for 'entity')."
+            ),
         )
         parser.add_argument(
             "--unlearning_task",
+            dest="revision_level",
             type=str,
             default="interaction",
-            choices=["interaction", "item"],
-            help="Type of unlearning task: 'interaction' or 'item'.",
+            choices=["interaction", "entity", "item"],
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
-            "--unlearning_interaction_ratio",
+            "--target_seed",
+            type=int,
+            default=42,
+            help="Fixed seed used to draw D_t from the outdated candidate pools.",
+        )
+        parser.add_argument(
+            "--outdated_fraction",
             type=float,
-            default=0.2,
-            help="Proportion of a user's interactions to remove in 'interaction' unlearning.",
+            default=0.25,
+            help=(
+                "Earliest fraction of each user's training interactions that "
+                "forms the outdated candidate pool C_u (paper: 25%)."
+            ),
         )
 
         # General parameters that might be used by multiple methods
@@ -464,89 +574,74 @@ class Config:
             help="Training mode for CertifiedRemoval: 'ovr' (One-vs-Rest) or 'binary'.",
         )
 
-        # Unranking Parameters (LPF + PAPU; paper Section 4 / Section 5.1.6).
+        # Unranking Parameters (LPF + PAPU; paper Sections 4.1, 4.2, and 5.1.6).
         parser.add_argument(
             "--unranking_hops",
             type=int,
-            default=1,
-            help="p-hop influence scope depth for LPF. Search in {0,1,2,3,4}.",
+            default=2,
+            help=(
+                "Propagation depth p of the influence scope D_inf. The paper "
+                "searches {0,1,2,3,4} and uses p=2 for the reported results; "
+                "p=1 is the lower-latency setting."
+            ),
         )
         parser.add_argument(
             "--unranking_damping_lambda",
             type=float,
             default=1e-2,
-            help="Damping coefficient lambda in (H_inf + lambda I) Delta = g.",
+            help="Damping factor lambda in (H_inf + lambda I) DeltaTheta = g.",
         )
         parser.add_argument(
             "--unranking_cg_steps",
             type=int,
             default=30,
-            help="Conjugate-gradient iteration count T. Search in {10,20,30,40,50}.",
+            help="Number of Conjugate Gradient iterations T (paper searches {10,20,30,40,50}).",
         )
         parser.add_argument(
             "--unranking_max_scope_interactions",
             type=int,
             default=0,
-            help="Optional runtime cap for |D_inf|. 0 disables the cap, matching the paper.",
+            help=(
+                "Optional runtime cap for |D_inf|; 0 disables the cap, which "
+                "matches the paper."
+            ),
         )
         parser.add_argument(
             "--unranking_no_scoping", type=str2bool, default=False,
-            help="Ablation: use the full interaction dataset instead of D_inf.",
+            help="Ablation 'w/o Scoping': use the whole dataset instead of D_inf.",
         )
         parser.add_argument(
             "--unranking_no_preference_factor", type=str2bool, default=False,
-            help="Ablation: use uniform contextual weights.",
+            help="Ablation 'w/o Preference Factor': use uniform interaction weights.",
         )
         parser.add_argument(
             "--unranking_no_structural", type=str2bool, default=False,
-            help="Ablation: drop I_struct from the preference factor.",
+            help="Ablation 'w/o Structural': drop I_struct from omega(v).",
         )
         parser.add_argument(
             "--unranking_no_semantic", type=str2bool, default=False,
-            help="Ablation: drop I_sem from the preference factor.",
+            help="Ablation 'w/o Semantic': drop I_sem from omega(v).",
         )
         parser.add_argument(
             "--unranking_no_contextual_correction", type=str2bool, default=False,
-            help="Ablation: drop the PAPU contextual correction on D_inf \\ D_t.",
-        )
-        parser.add_argument(
-            "--unranking_no_curvature", type=str2bool, default=False,
-            help="Ablation: replace H_inf with the damping identity.",
+            help="Ablation 'w/o Contextual Corr.': drop the D_inf \\ D_t term in g.",
         )
         parser.add_argument(
             "--unranking_dp", type=str2bool, default=False,
-            help="Enable the optional privacy-oriented Gaussian-noise variant.",
+            help="Optional 'Unranking (+ Noise)' privacy-oriented Gaussian-noise variant.",
         )
         parser.add_argument(
             "--unranking_dp_epsilon", type=float, default=1.0,
-            help="Epsilon for the optional DP-style Gaussian perturbation.",
+            help="Epsilon of the optional DP-style Gaussian perturbation.",
         )
         parser.add_argument(
             "--unranking_dp_delta", type=float, default=1e-5,
-            help="Delta for the optional DP-style Gaussian perturbation.",
+            help="Delta of the optional DP-style Gaussian perturbation.",
         )
-
-        # Legacy RARU aliases retained for older scripts.
-        parser.add_argument("--scope_cutoff_k", type=int, default=10,
-                            help="Legacy / unused RARU scope threshold alias.")
-        parser.add_argument("--damping_lambda", type=float, default=1e-2,
-                            help="Legacy alias for --unranking_damping_lambda.")
-        parser.add_argument("--cg_steps", type=int, default=30,
-                            help="Legacy alias for --unranking_cg_steps.")
-        parser.add_argument("--rarl_max_scope_size", type=int, default=5000,
-                            help="Legacy / unused RARU scope cap alias.")
-        parser.add_argument("--rarl_no_sconn", type=str2bool, default=False,
-                            help="Legacy alias for --unranking_no_structural.")
-        parser.add_argument("--rarl_no_sim", type=str2bool, default=False,
-                            help="Legacy alias for --unranking_no_semantic.")
-        parser.add_argument("--rarl_no_localized", type=str2bool, default=False,
-                            help="Legacy alias for --unranking_no_scoping.")
-        parser.add_argument("--rarl_no_salience_weight", type=str2bool, default=False,
-                            help="Legacy alias for --unranking_no_preference_factor.")
-        parser.add_argument("--rarl_no_margin", type=str2bool, default=False,
-                            help="Legacy / unused RARU margin-preservation alias.")
-        parser.add_argument("--rarl_no_curvature", type=str2bool, default=False,
-                            help="Legacy alias for --unranking_no_curvature.")
+        parser.add_argument(
+            "--unranking_dp_clip_norm", type=float, default=1.0,
+            help="Clipping norm C' for DeltaTheta in the optional noise variant.",
+        )
 
         # UltraRE Parameters
         parser.add_argument("--ultrare_n_group", type=int, default=3,

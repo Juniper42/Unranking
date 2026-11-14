@@ -84,10 +84,29 @@ def train_model(model, data, args, device, user_train_items=None, eval_interval=
 def train_gnn_model(model, data, args, device, user_train_items=None, eval_interval=5):
     """Trains a GNN-based model."""
     model.train()
-    optimizer = optim.AdamW(
+    optimizer = optim.Adam(
         model.parameters(), lr=args["lr"], weight_decay=args["weight_decay"]
     )
     loss_fcn = BPRLoss()
+
+    # Some baselines train sub-models without passing the user->items map.
+    # Use the graph currently attached to ``data`` (full training graph,
+    # retained graph, or a shard) so that positive sampling follows the
+    # graph actually being trained.
+    if user_train_items is None:
+        user_train_items = {}
+        if hasattr(data, "train_ratings") and not data.train_ratings.empty:
+            grouped = data.train_ratings.groupby("user_idx")["item_idx"].apply(set)
+            user_train_items = {int(u): set(items) for u, items in grouped.items()}
+        else:
+            edges = data.train_edge_index
+            for u, i in zip(
+                edges[0].detach().cpu().tolist(), edges[1].detach().cpu().tolist()
+            ):
+                if i >= data.num_users:
+                    user_train_items.setdefault(int(u), set()).add(
+                        int(i - data.num_users)
+                    )
 
     edge_index = data.train_edge_index.to(device)
     num_users, num_items = data.num_users, data.num_items
@@ -143,7 +162,7 @@ def train_gnn_model(model, data, args, device, user_train_items=None, eval_inter
             neg_item_emb = item_embeddings[neg_items]
 
             loss, mf_loss, reg_loss = loss_fcn(
-                user_emb, pos_item_emb, neg_item_emb, args["weight_decay"]
+                user_emb, pos_item_emb, neg_item_emb, args["reg_weight"]
             )
 
             optimizer.zero_grad()
@@ -170,7 +189,7 @@ def train_gnn_model(model, data, args, device, user_train_items=None, eval_inter
                     batch_size=args["eval_batch_size"],
                     user_train_items=user_train_items,
                     k=args["k"],
-                    is_test=True,
+                    is_test=False,
                 )
             print_metrics(valid_metrics, prefix="Validation")
 
@@ -200,7 +219,7 @@ def train_neumf_model(
 ):
     """Trains a NeuMF model."""
     model.train()
-    optimizer = optim.AdamW(
+    optimizer = optim.Adam(
         model.parameters(), lr=args["lr"], weight_decay=args["weight_decay"]
     )
     criterion = nn.BCEWithLogitsLoss()
@@ -270,7 +289,7 @@ def train_neumf_model(
                     batch_size=args["eval_batch_size"],
                     user_train_items=user_train_items,
                     k=args["k"],
-                    is_test=True,
+                    is_test=False,
                 )
             print_metrics(valid_metrics, prefix="Validation")
 
@@ -300,7 +319,7 @@ def train_non_gnn_model(
 ):
     """Trains a non-GNN model (e.g., MLP, GMF)."""
     model.train()
-    optimizer = optim.AdamW(
+    optimizer = optim.Adam(
         model.parameters(), lr=args["lr"], weight_decay=args["weight_decay"]
     )
 
@@ -369,7 +388,7 @@ def train_non_gnn_model(
                     batch_size=args["eval_batch_size"],
                     user_train_items=user_train_items,
                     k=args["k"],
-                    is_test=True,
+                    is_test=False,
                 )
             print_metrics(valid_metrics, prefix="Validation")
 
@@ -397,7 +416,7 @@ def train_non_gnn_model(
 def train_wmf_model(model, data, args, device, user_train_items=None, eval_interval=5):
     """Trains a WMF model with the BCE objective used in the paper."""
     model.train()
-    optimizer = optim.AdamW(
+    optimizer = optim.Adam(
         model.parameters(),
         lr=args.get("lr", 0.001),
         weight_decay=args.get("weight_decay", 0.0),
@@ -469,7 +488,7 @@ def train_wmf_model(model, data, args, device, user_train_items=None, eval_inter
                     batch_size=args["eval_batch_size"],
                     user_train_items=user_train_items,
                     k=args.get("k", 10),
-                    is_test=True,
+                    is_test=False,
                 )
             print_metrics(valid_metrics, prefix=f"Validation (WMF Epoch {epoch+1})")
 

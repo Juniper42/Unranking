@@ -1,4 +1,3 @@
-import logging
 import random
 import time
 
@@ -23,418 +22,529 @@ logger = Logger.get_logger("MIAttack")
 
 
 class MembershipInferenceAttack:
-    """
-    Implements a black-box Membership Inference Attack (MIA) to evaluate privacy leakage.
+    """Membership-inference probe used to compute the Revision Rate (RR).
+
+    The paper uses the MIA probe as a *probe for the residual preference
+    imprint*, not as a privacy claim.  The protocol follows Section 5.1.6:
+
+    * members are the target interactions ``D_t``;
+    * an equal number of non-members is sampled from the validation and test
+      interactions of the same users, matched by item-popularity group
+      computed on the retained training data;
+    * the interaction pairs are split 6:2:2 into attack-training, validation,
+      and test sets, with class balance preserved in each split;
+    * the probe is a three-layer MLP (8 -> 64 -> 32 -> 1) trained on the
+      pre-revision model outputs with BCE and Adam, batch size 256, for up to
+      100 epochs with early stopping after 10 epochs without validation-AUROC
+      improvement;
+    * the trained probe and feature preprocessing are frozen and applied to
+      the same test pairs for the revised model;
+    * ``RR = symmetric-AUC(M_p) / symmetric-AUC(M')``, where the symmetric AUC
+      is ``max(AUC, 1 - AUC)``.
     """
 
-    def __init__(self, original_model, unlearning_model, data, device, args):
-        self.original_model = original_model
-        self.unlearning_model = unlearning_model
+    def __init__(self, pre_revision_model, revised_model, data, device, args):
+        self.pre_revision_model = pre_revision_model
+        self.revised_model = revised_model
         self.data = data
         self.device = device
         self.args = args
 
-        # Attack model training parameters
-        self.attack_batch_size = args.get("attack_batch_size", 256)
-        self.attack_epochs = args.get("attack_epochs", 50)
-        self.attack_lr = args.get("attack_lr", 0.001)
+        self.seed = int(args.get("target_seed", args.get("random_seed", 42)))
+        self.attack_batch_size = int(args.get("attack_batch_size", 256))
+        self.attack_epochs = int(args.get("attack_epochs", 100))
+        self.attack_lr = float(args.get("attack_lr", 1e-3))
+        self.attack_patience = int(args.get("attack_patience", 10))
+        self.max_pairs = int(args.get("attack_max_pairs", 10000))
+        self.popularity_bins = int(args.get("mia_popularity_bins", 10))
 
-    def get_model_predictions(self, model, users, items, edge_index=None):
-        """
-        Retrieves prediction scores from a recommendation model in a black-box manner.
+        self.probe = None
+        self.feature_mean = None
+        self.feature_std = None
+        self.test_features = None
+        self.test_labels = None
+        self.num_members = 0
+        self.num_non_members = 0
+        self.attack_train_size = 0
 
-        Args:
-            model: The recommendation model.
-            users: Tensor of user indices.
-            items: Tensor of item indices (raw, with user count offset).
-            edge_index: Edge index required by some GNN models.
-
-        Returns:
-            A tensor of prediction scores.
-        """
-        predictions = []
-        batch_size = 1024  # Batching to prevent OOM errors
-
-        model.eval()
-        with torch.no_grad():
-            for i in range(0, users.size(0), batch_size):
-                batch_users = users[i : i + batch_size]
-                batch_items = items[i : i + batch_size]
-                # Item indices need to be adjusted to be in the range [0, num_items-1]
-                adjusted_items = batch_items - self.data.num_users
-
-                try:
-                    if determine_is_gnn(self.args.get("backbone")):
-                        graph_edge_index = edge_index
-                        if graph_edge_index is None:
-                            graph_edge_index = self.data.train_edge_index
-                        user_emb, item_emb = model(
-                            edge_index=graph_edge_index.to(self.device)
-                        )
-                        batch_preds = torch.sum(
-                            user_emb[batch_users] * item_emb[adjusted_items], dim=1
-                        )
-                    else:
-                        # Primary method: use the model's forward pass.
-                        batch_preds = model.forward(batch_users, adjusted_items)
-                    predictions.append(batch_preds.cpu())
-                except Exception as e:
-                    logger.warning(
-                        f"Prediction via forward() failed: {e}. Trying fallback."
-                    )
-                    # Fallback method: directly compute dot product of embeddings
-                    try:
-                        user_emb, item_emb = model.get_embeddings()
-                        batch_user_emb = user_emb[batch_users]
-                        batch_item_emb = item_emb[adjusted_items]
-                        batch_preds = torch.sum(batch_user_emb * batch_item_emb, dim=1)
-                        predictions.append(batch_preds.cpu())
-                    except Exception as e2:
-                        logger.error(
-                            f"Fallback prediction method also failed: {e2}. Returning zero scores."
-                        )
-                        predictions.append(torch.zeros(batch_users.size(0)))
-
-        return torch.cat(predictions, dim=0)
-
-    def extract_features_blackbox(self, target_edges, is_member):
-        """
-        Extracts features for the attack model based on prediction scores (black-box).
-
-        Args:
-            target_edges: A list of (user, item) tuples.
-            is_member: Boolean indicating if these edges are members of the training set.
-
-        Returns:
-            A tuple of (features, labels) tensors.
-        """
-        if not target_edges:
-            return None, None
-
-        users = torch.tensor([u for u, i in target_edges], device=self.device)
-        items = torch.tensor([i for u, i in target_edges], device=self.device)
-
-        # Get prediction scores from both original and unlearned models
-        orig_scores = self.get_model_predictions(
-            self.original_model, users, items, edge_index=self.data.train_edge_index
-        ).to(self.device)
-
-        unlearning_edge_index = getattr(
-            self.data, "train_edge_index_after_remove", self.data.train_edge_index
-        )
-        unlearn_scores = self.get_model_predictions(
-            self.unlearning_model, users, items, edge_index=unlearning_edge_index
-        ).to(self.device)
-
-        # Construct features based on the prediction scores
-        features = self.compute_score_based_features(orig_scores, unlearn_scores)
-        labels = (
-            torch.ones(len(target_edges))
-            if is_member
-            else torch.zeros(len(target_edges))
-        )
-
-        return features.cpu(), labels
-
-    def compute_score_based_features(self, orig_scores, unlearn_scores):
-        """
-        Computes the eight distance-based posterior features used by the paper.
-
-        Args:
-            orig_scores: Prediction scores from the original model.
-            unlearn_scores: Prediction scores from the unlearned model.
-
-        Returns:
-            A tensor of computed features.
-        """
-        eps = 1e-8
-        orig_prob = torch.sigmoid(orig_scores).clamp(eps, 1.0 - eps)
-        unlearn_prob = torch.sigmoid(unlearn_scores).clamp(eps, 1.0 - eps)
-        orig_post = torch.stack([orig_prob, 1.0 - orig_prob], dim=1)
-        unlearn_post = torch.stack([unlearn_prob, 1.0 - unlearn_prob], dim=1)
-
-        diff = orig_post - unlearn_post
-        l1_distance = diff.abs().sum(dim=1)
-        l2_distance = torch.sqrt(diff.pow(2).sum(dim=1) + eps)
-        cosine_distance = 1.0 - F.cosine_similarity(orig_post, unlearn_post, dim=1)
-        linf_distance = diff.abs().max(dim=1).values
-        kl_orig_unlearn = (
-            orig_post * torch.log((orig_post + eps) / (unlearn_post + eps))
-        ).sum(dim=1)
-        kl_unlearn_orig = (
-            unlearn_post * torch.log((unlearn_post + eps) / (orig_post + eps))
-        ).sum(dim=1)
-        midpoint = 0.5 * (orig_post + unlearn_post)
-        js_divergence = 0.5 * (
-            orig_post * torch.log((orig_post + eps) / (midpoint + eps))
-        ).sum(dim=1) + 0.5 * (
-            unlearn_post * torch.log((unlearn_post + eps) / (midpoint + eps))
-        ).sum(dim=1)
-        logit_l2 = torch.sqrt((orig_scores - unlearn_scores).pow(2) + eps)
-
-        feature_list = [
-            l1_distance,
-            l2_distance,
-            cosine_distance,
-            linf_distance,
-            kl_orig_unlearn,
-            kl_unlearn_orig,
-            js_divergence,
-            logit_l2,
-        ]
-
-        return torch.stack(feature_list, dim=1)
-
-    def canonicalize_edges(self, edges):
-        """Returns unique forward (user, global_item_node) pairs."""
+    # ------------------------------------------------------------------
+    # Pair construction
+    # ------------------------------------------------------------------
+    def _canonical_pairs(self, edges):
+        """Return unique ``(user, local_item)`` pairs from forward/reverse edges."""
+        if edges is None or edges.numel() == 0:
+            return []
+        pairs = set()
         item_lo = self.data.num_users
         item_hi = self.data.num_users + self.data.num_items
-        canonical = set()
         for src, dst in edges.t().detach().cpu().tolist():
             if 0 <= src < self.data.num_users and item_lo <= dst < item_hi:
-                canonical.add((src, dst))
+                pairs.add((int(src), int(dst - self.data.num_users)))
             elif item_lo <= src < item_hi and 0 <= dst < self.data.num_users:
-                canonical.add((dst, src))
-        return canonical
+                pairs.add((int(dst), int(src - self.data.num_users)))
+        return sorted(pairs)
 
-    def prepare_attack_dataset(self, edges_to_remove=None):
-        """
-        Prepares the dataset for the MIA attack.
-        This involves identifying member (forgotten) and non-member edges and extracting features.
-
-        Args:
-            edges_to_remove: The edges that were removed during unlearning.
-
-        Returns:
-            A tuple of (train_features, train_labels, test_features, test_labels).
-        """
-        logger.info("Preparing black-box MIA dataset...")
-
-        # Identify the set of edges that were removed (these are the 'member' samples)
-        if edges_to_remove is None or edges_to_remove.numel() == 0:
-            logger.error("No edges_to_remove provided for MIA. Aborting.")
-            return None, None, None, None
-
-        removed_edges = self.canonicalize_edges(edges_to_remove)
-        logger.info(
-            f"Identified {len(removed_edges)} unique edges to be forgotten (members)."
-        )
-
-        # Cap the number of member edges to prevent excessive computation
-        max_member_samples = 10000
-        if len(removed_edges) > max_member_samples:
-            removed_edges = set(random.sample(list(removed_edges), max_member_samples))
-            logger.info(f"Capped member samples to {len(removed_edges)}.")
-
-        # Identify all edges present in the original training set
-        original_train_edges = self.canonicalize_edges(self.data.train_edge_index)
-
-        # Generate non-member edges: edges not in the original training set
-        num_non_members = len(removed_edges)
-        non_member_edges = set()
-        max_attempts = num_non_members * 5
-        logger.info(f"Generating {num_non_members} non-member edges...")
-
-        while len(non_member_edges) < num_non_members and max_attempts > 0:
-            random_users = torch.randint(0, self.data.num_users, (num_non_members,))
-            random_items = torch.randint(
-                self.data.num_users,
-                self.data.num_users + self.data.num_items,
-                (num_non_members,),
+    def _popularity_groups(self):
+        """Assign each item to an item-popularity decile on retained training data."""
+        ratings = getattr(self.data, "train_ratings_after_remove", None)
+        if ratings is None or ratings.empty:
+            ratings = getattr(self.data, "train_ratings", None)
+        counts = np.zeros(self.data.num_items, dtype=np.int64)
+        if ratings is not None and not ratings.empty:
+            np.add.at(
+                counts,
+                ratings["item_idx"].astype(int).to_numpy(),
+                1,
             )
 
-            for i in range(num_non_members):
-                u, v = random_users[i].item(), random_items[i].item()
-                edge = (u, v)
-                if edge not in original_train_edges and edge not in non_member_edges:
-                    non_member_edges.add(edge)
-                if len(non_member_edges) >= num_non_members:
-                    break
-            max_attempts -= num_non_members
+        # Rank items by popularity and cut the ranking into equal-frequency
+        # groups.  Unseen items form their own group (-1).
+        order = np.argsort(counts, kind="stable")
+        ranks = np.empty(self.data.num_items, dtype=np.int64)
+        ranks[order] = np.arange(self.data.num_items)
+        groups = np.floor(
+            ranks / max(self.data.num_items - 1, 1) * self.popularity_bins
+        ).astype(np.int64)
+        groups = np.clip(groups, 0, max(self.popularity_bins - 1, 0))
+        groups[counts == 0] = -1
+        return groups, counts
 
-        logger.info(f"Generated {len(non_member_edges)} non-member edges.")
+    def _validation_test_items_by_user(self):
+        by_user = {}
+        for attr in ("val_ratings", "test_ratings"):
+            ratings = getattr(self.data, attr, None)
+            if ratings is None or ratings.empty:
+                continue
+            for u, i in zip(
+                ratings["user_idx"].astype(int).tolist(),
+                ratings["item_idx"].astype(int).tolist(),
+            ):
+                by_user.setdefault(int(u), []).append(int(i))
+        return by_user
 
-        # Extract features for both sets
-        logger.info("Extracting features... This may take a while.")
-        member_features, member_labels = self.extract_features_blackbox(
-            list(removed_edges), is_member=True
+    def _build_member_nonmember_pairs(self, target_edges):
+        """Build ``D_t`` members and popularity-matched non-members."""
+        members = self._canonical_pairs(target_edges)
+        if not members:
+            logger.warning("D_t is empty; the MIA probe cannot be built.")
+            return [], []
+
+        if 0 < self.max_pairs < len(members):
+            rng = random.Random(self.seed)
+            members = rng.sample(members, self.max_pairs)
+            logger.info(
+                "Capped MIA members to %d interactions for tractability "
+                "(runtime safeguard; the paper does not specify a cap).",
+                len(members),
+            )
+
+        groups, _ = self._popularity_groups()
+        val_test_by_user = self._validation_test_items_by_user()
+        # Validation and test interactions are disjoint from every training
+        # set by construction, so they are valid non-members without
+        # materialising the 100M-interaction training pair set.
+        rng = random.Random(self.seed + 1)
+
+        non_members = set()
+        unmatched = 0
+        for user, item in members:
+            candidates = [
+                candidate
+                for candidate in val_test_by_user.get(user, [])
+                if (user, candidate) not in non_members
+            ]
+            if not candidates:
+                unmatched += 1
+                continue
+
+            target_group = int(groups[item])
+            matched = [
+                candidate
+                for candidate in candidates
+                if int(groups[candidate]) == target_group
+            ]
+            pool = matched if matched else candidates
+            non_members.add((user, rng.choice(pool)))
+            if len(non_members) >= len(members):
+                break
+
+        non_members = sorted(non_members)
+        if unmatched:
+            logger.warning(
+                "No validation/test non-member was available for %d target "
+                "interactions; they are excluded from the probe.",
+                unmatched,
+            )
+        if not non_members:
+            logger.warning(
+                "Could not sample non-members from validation/test data. "
+                "Set val_size > 0 so the MIA protocol can be applied."
+            )
+            return [], []
+
+        # Keep the two classes balanced.
+        size = min(len(members), len(non_members))
+        if len(members) > size:
+            members = rng.sample(members, size)
+        if len(non_members) > size:
+            non_members = rng.sample(non_members, size)
+        return members, non_members
+
+    def _split_pairs(self, members, non_members):
+        """Split each class 6:2:2 and concatenate the splits."""
+        rng = random.Random(self.seed + 2)
+
+        def split_class(pairs):
+            pairs = list(pairs)
+            rng.shuffle(pairs)
+            n = len(pairs)
+            if n == 0:
+                return [], [], []
+            if n < 5:
+                # Degenerate split for tiny probes; kept disjoint.
+                n_train = max(1, n - 2)
+                n_val = 1 if n - n_train >= 2 else 0
+                return pairs[:n_train], pairs[n_train : n_train + n_val], pairs[n_train + n_val :]
+            n_train = int(round(0.6 * n))
+            n_val = int(round(0.2 * n))
+            n_train = min(max(n_train, 1), n)
+            n_val = min(n_val, n - n_train)
+            return pairs[:n_train], pairs[n_train : n_train + n_val], pairs[n_train + n_val :]
+
+        m_train, m_val, m_test = split_class(members)
+        n_train, n_val, n_test = split_class(non_members)
+        train_pairs = m_train + n_train
+        val_pairs = m_val + n_val
+        test_pairs = m_test + n_test
+        train_labels = [1] * len(m_train) + [0] * len(n_train)
+        val_labels = [1] * len(m_val) + [0] * len(n_val)
+        test_labels = [1] * len(m_test) + [0] * len(n_test)
+        return (
+            (train_pairs, train_labels),
+            (val_pairs, val_labels),
+            (test_pairs, test_labels),
         )
-        non_member_features, non_member_labels = self.extract_features_blackbox(
-            list(non_member_edges), is_member=False
+
+    # ------------------------------------------------------------------
+    # Single-model posterior features
+    # ------------------------------------------------------------------
+    def _graph_for_model(self, model):
+        if model is self.pre_revision_model:
+            return getattr(
+                self.data, "pre_revision_edge_index", self.data.train_edge_index
+            )
+        return getattr(
+            self.data,
+            "eval_edge_index",
+            getattr(self.data, "train_edge_index_after_remove", self.data.train_edge_index),
         )
 
-        if member_features is None or non_member_features is None:
-            logger.error("Feature extraction failed. Cannot proceed with the attack.")
-            return None, None, None, None
+    @torch.no_grad()
+    def _embeddings_for_model(self, model, graph_edge_index):
+        model.eval()
+        if hasattr(model, "clear_cache"):
+            model.clear_cache()
+        if determine_is_gnn(self.args.get("backbone")):
+            user_emb, item_emb = model(edge_index=graph_edge_index.to(self.device))
+        else:
+            user_emb, item_emb = model.get_embeddings()
+        return user_emb, item_emb
 
-        # Combine, normalize, and split the dataset
-        all_features = torch.cat([member_features, non_member_features], dim=0)
-        all_labels = torch.cat([member_labels, non_member_labels], dim=0)
+    @torch.no_grad()
+    def _features_for_pairs(self, model, pairs):
+        """Eight distance-based features extracted from model posteriors.
 
-        logger.info(
-            f"Feature extraction complete. Total samples: {all_features.shape[0]}, Feature dim: {all_features.shape[1]}"
-        )
-
-        # Normalize features
-        feature_mean = all_features.mean(dim=0, keepdim=True)
-        feature_std = all_features.std(dim=0, keepdim=True) + 1e-6
-        all_features = (all_features - feature_mean) / feature_std
-
-        # Shuffle and split into training and testing sets
-        indices = torch.randperm(all_features.size(0))
-        train_size = int(0.8 * all_features.size(0))
-        train_indices, test_indices = indices[:train_size], indices[train_size:]
-
-        train_features, test_features = (
-            all_features[train_indices],
-            all_features[test_indices],
-        )
-        train_labels, test_labels = all_labels[train_indices], all_labels[test_indices]
-
-        logger.info(
-            f"Dataset prepared: {len(train_labels)} training samples, {len(test_labels)} test samples."
-        )
-        return train_features, train_labels, test_features, test_labels
-
-    def train_attack_model(self, train_features, train_labels):
+        The features combine the interaction posterior with embedding-level
+        cosine, Euclidean, and L1 distances, plus distributional distances
+        (entropy and deviation from chance).  They are computed from a single
+        model so that the same frozen probe can be applied to every variant.
         """
-        Trains the MIA attack model.
-        """
-        logger.info(f"Training MIA model on {self.device}...")
+        if not pairs:
+            return torch.empty((0, 8), dtype=torch.float, device=self.device)
+
+        users = torch.tensor(
+            [u for u, _ in pairs], dtype=torch.long, device=self.device
+        )
+        items = torch.tensor(
+            [i for _, i in pairs], dtype=torch.long, device=self.device
+        )
+        graph_edge_index = self._graph_for_model(model)
+        user_emb, item_emb = self._embeddings_for_model(model, graph_edge_index)
+        if determine_is_gnn(self.args.get("backbone")):
+            scores = torch.sum(user_emb[users] * item_emb[items], dim=1).cpu()
+        else:
+            scores = model(user_indices=users, item_indices=items).detach().cpu()
+        u_emb = user_emb[users].detach().cpu()
+        i_emb = item_emb[items].detach().cpu()
+
+        eps = 1e-8
+        posterior = torch.sigmoid(scores).clamp(eps, 1.0 - eps)
+        cosine = F.cosine_similarity(u_emb, i_emb, dim=1)
+        euclidean = torch.sqrt(((u_emb - i_emb) ** 2).sum(dim=1) + eps)
+        l1 = (u_emb - i_emb).abs().sum(dim=1)
+        entropy = -(
+            posterior * torch.log(posterior)
+            + (1.0 - posterior) * torch.log(1.0 - posterior)
+        )
+        chance_distance = (posterior - 0.5).abs()
+
+        features = torch.stack(
+            [
+                posterior,
+                scores,
+                1.0 - cosine,
+                euclidean,
+                l1,
+                entropy,
+                chance_distance,
+                torch.log1p(euclidean),
+            ],
+            dim=1,
+        )
+        return features.detach().cpu()
+
+    # ------------------------------------------------------------------
+    # Probe training and evaluation
+    # ------------------------------------------------------------------
+    def _standardize(self, train_features, *other_features):
+        self.feature_mean = train_features.mean(dim=0, keepdim=True)
+        self.feature_std = train_features.std(dim=0, keepdim=True) + 1e-6
+        standardized = [(train_features - self.feature_mean) / self.feature_std]
+        for features in other_features:
+            standardized.append((features - self.feature_mean) / self.feature_std)
+        return standardized
+
+    def _fit_probe(self, train_features, train_labels, val_features, val_labels):
+        # Freeze the probe initialization and mini-batch order so that the
+        # same probe is used for every revised model variant.
+        torch.manual_seed(self.seed + 100)
+        np.random.seed(self.seed + 100)
+        random.seed(self.seed + 100)
+        self.probe = MIAttackModel(train_features.size(1)).to(self.device)
+        optimizer = torch.optim.Adam(self.probe.parameters(), lr=self.attack_lr)
+        criterion = nn.BCEWithLogitsLoss()
 
         train_features = train_features.to(self.device)
-        train_labels = train_labels.to(self.device)
+        train_labels = train_labels.to(self.device).float()
+        val_features = val_features.to(self.device)
+        val_labels_np = val_labels.cpu().numpy()
 
-        attack_model = MIAttackModel(train_features.size(1)).to(self.device)
-        optimizer = torch.optim.Adam(
-            attack_model.parameters(), lr=self.attack_lr, weight_decay=1e-5
-        )
-
-        # Handle data imbalance by assigning more weight to the minority class in the loss
-        pos_count = (train_labels == 1).sum().item()
-        neg_count = (train_labels == 0).sum().item()
-        pos_weight = (
-            torch.tensor([neg_count / pos_count], device=self.device)
-            if pos_count > 0
-            else None
-        )
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        attack_model.train()
+        best_auc = -1.0
+        best_state = None
+        patience = 0
         for epoch in range(self.attack_epochs):
-            total_loss = 0
+            self.probe.train()
+            perm = torch.randperm(train_features.size(0), device=self.device)
+            total_loss = 0.0
             num_batches = 0
-
-            # Shuffle data each epoch
-            perm = torch.randperm(train_features.size(0))
-            for i in range(0, train_features.size(0), self.attack_batch_size):
-                indices = perm[i : i + self.attack_batch_size]
-                batch_features, batch_labels = (
-                    train_features[indices],
-                    train_labels[indices],
-                )
-
+            for start in range(0, train_features.size(0), self.attack_batch_size):
+                indices = perm[start : start + self.attack_batch_size]
                 optimizer.zero_grad()
-                logits = attack_model(batch_features).view(-1)
-                loss = criterion(logits, batch_labels)
+                logits = self.probe(train_features[indices]).view(-1)
+                loss = criterion(logits, train_labels[indices])
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(attack_model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.probe.parameters(), max_norm=1.0)
                 optimizer.step()
-
                 total_loss += loss.item()
                 num_batches += 1
 
+            self.probe.eval()
+            with torch.no_grad():
+                val_scores = (
+                    torch.sigmoid(self.probe(val_features).view(-1)).cpu().numpy()
+                )
+            if len(np.unique(val_labels_np)) > 1:
+                val_auc = roc_auc_score(val_labels_np, val_scores)
+            else:
+                val_auc = 0.5
+
+            if val_auc > best_auc + 1e-6:
+                best_auc = val_auc
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.probe.state_dict().items()
+                }
+                patience = 0
+            else:
+                patience += 1
+
             if (epoch + 1) % 10 == 0:
                 logger.info(
-                    f"Epoch {epoch+1}/{self.attack_epochs}, Avg Loss: {total_loss / num_batches:.4f}"
+                    "MIA probe epoch %d/%d: loss=%.4f, val AUROC=%.4f",
+                    epoch + 1,
+                    self.attack_epochs,
+                    total_loss / max(num_batches, 1),
+                    val_auc,
                 )
+            if patience >= self.attack_patience:
+                logger.info(
+                    "MIA probe early stopping at epoch %d (best val AUROC=%.4f).",
+                    epoch + 1,
+                    best_auc,
+                )
+                break
 
-        logger.info("MIA model training complete.")
-        return attack_model.to(self.device)
+        if best_state is not None:
+            self.probe.load_state_dict(best_state)
+        self.probe.eval()
+        return best_auc
 
-    def evaluate_attack(self, attack_model, test_features, test_labels):
-        """
-        Evaluates the performance of the trained MIA attack model.
-        """
-        logger.info("Evaluating MIA model...")
-        attack_model.eval()
-        test_features = test_features.to(self.device)
-        test_labels = test_labels.cpu().numpy()
-
-        with torch.no_grad():
-            # Use sigmoid since the model outputs logits and we used BCEWithLogitsLoss
-            outputs = torch.sigmoid(attack_model(test_features).view(-1)).cpu().numpy()
-
-        predictions = (outputs > 0.5).astype(int)
-
-        # Calculate standard classification metrics
-        accuracy = accuracy_score(test_labels, predictions)
-        precision = precision_score(test_labels, predictions, zero_division=0)
-        recall = recall_score(test_labels, predictions, zero_division=0)
-        f1 = f1_score(test_labels, predictions, zero_division=0)
-        auc = roc_auc_score(test_labels, outputs)
-        ap = average_precision_score(test_labels, outputs)
-
-        # Calculate additional privacy-specific metrics
-        member_indices = test_labels == 1
-        non_member_indices = test_labels == 0
-
-        member_confidence = (
-            outputs[member_indices].mean() if member_indices.any() else 0
+    @torch.no_grad()
+    def _evaluate_probe(self, features, labels):
+        features = features.to(self.device)
+        labels_np = labels.cpu().numpy()
+        probabilities = (
+            torch.sigmoid(self.probe(features).view(-1)).cpu().numpy()
         )
-        non_member_confidence = (
-            outputs[non_member_indices].mean() if non_member_indices.any() else 0
+        predictions = (probabilities > 0.5).astype(int)
+        auc = (
+            roc_auc_score(labels_np, probabilities)
+            if len(np.unique(labels_np)) > 1
+            else 0.5
         )
-        prob_gap = abs(member_confidence - non_member_confidence)
+        metrics = {
+            "accuracy": accuracy_score(labels_np, predictions),
+            "precision": precision_score(labels_np, predictions, zero_division=0),
+            "recall": recall_score(labels_np, predictions, zero_division=0),
+            "f1_score": f1_score(labels_np, predictions, zero_division=0),
+            "auc": auc,
+            "symmetric_auc": max(auc, 1.0 - auc),
+            "average_precision": (
+                average_precision_score(labels_np, probabilities)
+                if len(np.unique(labels_np)) > 1
+                else 0.0
+            ),
+        }
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+    def run_attack(self, target_edges=None):
+        """Train the probe on ``M_p`` and evaluate it on ``M'``.
+
+        Returns a dictionary containing the pre- and post-revision AUCs and
+        the Revision Rate ``RR = symmetric-AUC(M_p) / symmetric-AUC(M')``.
+        """
+        logger.info(
+            "Starting the membership-inference probe for RR "
+            "(preference-imprint probe, not a privacy claim)."
+        )
+        start = time.time()
+        if target_edges is None:
+            target_edges = getattr(self.data, "edges_to_remove", None)
+        if target_edges is None or target_edges.numel() == 0:
+            logger.error("No target set D_t provided for the MIA probe.")
+            return None
+
+        members, non_members = self._build_member_nonmember_pairs(target_edges)
+        if not members or not non_members:
+            return None
+        self.num_members = len(members)
+        self.num_non_members = len(non_members)
+
+        (
+            (train_pairs, train_labels),
+            (val_pairs, val_labels),
+            (test_pairs, test_labels),
+        ) = self._split_pairs(members, non_members)
+        if not train_pairs or not val_pairs or not test_pairs:
+            logger.warning(
+                "MIA split is empty (train=%d, val=%d, test=%d); "
+                "the probe cannot be trained.",
+                len(train_pairs),
+                len(val_pairs),
+                len(test_pairs),
+            )
+            return None
+        self.attack_train_size = len(train_pairs)
+        self.test_pairs = test_pairs
+        self.test_labels = torch.tensor(test_labels, dtype=torch.float)
+
+        logger.info(
+            "MIA pairs: %d members, %d non-members; split %d/%d/%d.",
+            self.num_members,
+            self.num_non_members,
+            len(train_pairs),
+            len(val_pairs),
+            len(test_pairs),
+        )
+
+        # Pre-revision features and frozen preprocessing.
+        train_features = self._features_for_pairs(self.pre_revision_model, train_pairs)
+        val_features = self._features_for_pairs(self.pre_revision_model, val_pairs)
+        test_features = self._features_for_pairs(self.pre_revision_model, test_pairs)
+        train_features, val_features, test_features = self._standardize(
+            train_features, val_features, test_features
+        )
+        self.test_features = test_features
+        self._fit_probe(
+            train_features,
+            torch.tensor(train_labels, dtype=torch.float),
+            val_features,
+            torch.tensor(val_labels, dtype=torch.float),
+        )
+        pre_metrics = self._evaluate_probe(test_features, self.test_labels)
 
         results = {
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1_score": f1,
-            "auc": auc,
-            "average_precision": ap,
-            "member_confidence": member_confidence,
-            "non_member_confidence": non_member_confidence,
-            "probability_gap": prob_gap,
+            "auroc_pre_revision": pre_metrics["auc"],
+            "symmetric_auroc_pre_revision": pre_metrics["symmetric_auc"],
+            "num_members": self.num_members,
+            "num_non_members": self.num_non_members,
+            "attack_train_size": self.attack_train_size,
+            "attack_test_size": len(test_pairs),
         }
+
+        if self.revised_model is not None:
+            revised_features = self._features_for_pairs(
+                self.revised_model, test_pairs
+            )
+            revised_features = (
+                revised_features - self.feature_mean
+            ) / self.feature_std
+            post_metrics = self._evaluate_probe(revised_features, self.test_labels)
+            rr = (
+                pre_metrics["symmetric_auc"] / post_metrics["symmetric_auc"]
+                if post_metrics["symmetric_auc"] > 0
+                else float("inf")
+            )
+            results.update(
+                {
+                    "auroc_post_revision": post_metrics["auc"],
+                    "symmetric_auroc_post_revision": post_metrics["symmetric_auc"],
+                    "RR": rr,
+                    "accuracy": post_metrics["accuracy"],
+                    "precision": post_metrics["precision"],
+                    "recall": post_metrics["recall"],
+                    "f1_score": post_metrics["f1_score"],
+                    "auc": post_metrics["auc"],
+                    "average_precision": post_metrics["average_precision"],
+                }
+            )
+            logger.info(
+                "MIA-AUC(M_p)=%.4f, MIA-AUC(M')=%.4f, "
+                "symmetric AUC %.4f -> %.4f, RR=%.4f.",
+                pre_metrics["auc"],
+                post_metrics["auc"],
+                pre_metrics["symmetric_auc"],
+                post_metrics["symmetric_auc"],
+                rr,
+            )
+        else:
+            results.update(
+                {
+                    "auroc_post_revision": None,
+                    "symmetric_auroc_post_revision": None,
+                    "RR": None,
+                    "auc": pre_metrics["auc"],
+                }
+            )
+            logger.info(
+                "MIA-AUC(M_p)=%.4f (no revised model supplied).",
+                pre_metrics["auc"],
+            )
+
+        logger.info(
+            "MIA probe finished in %.2fs.", time.time() - start
+        )
         return results
-
-    def run_attack(self, edges_to_remove=None):
-        """
-        Executes the full black-box Membership Inference Attack pipeline.
-        """
-        logger.info("Starting black-box Membership Inference Attack...")
-
-        # Set random seeds for reproducibility
-        seed = self.args.get("random_seed", 42)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-        # 1. Prepare dataset
-        dataset = self.prepare_attack_dataset(edges_to_remove)
-        if dataset is None:
-            return None
-        train_features, train_labels, test_features, test_labels = dataset
-
-        # 2. Train attack model
-        attack_model = self.train_attack_model(train_features, train_labels)
-
-        # 3. Evaluate attack model
-        attack_results = self.evaluate_attack(attack_model, test_features, test_labels)
-
-        # 4. Log results
-        logger.info("\n--- Black-Box MIA Results ---")
-        logger.info(f"  Accuracy:           {attack_results['accuracy']:.4f}")
-        logger.info(f"  Precision:          {attack_results['precision']:.4f}")
-        logger.info(f"  Recall:             {attack_results['recall']:.4f}")
-        logger.info(f"  F1-Score:           {attack_results['f1_score']:.4f}")
-        logger.info(f"  AUC:                {attack_results['auc']:.4f}")
-        logger.info(f"  Average Precision:  {attack_results['average_precision']:.4f}")
-        logger.info(f"  Confidence Gap:     {attack_results['probability_gap']:.4f}")
-        logger.info("---------------------------\n")
-
-        return attack_results

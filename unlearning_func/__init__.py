@@ -13,6 +13,7 @@ from .CertifiedRemoval import CertifiedRemoval
 from .GFEraser import GFEraser
 from .GSGCF_RU import GSGCF_RU
 from .IFRU import IFRU
+from .PostFiltering import PostFiltering
 from .Unranking import Unranking
 from .RecEraser import RecEraser
 from .RRL import RRL
@@ -64,19 +65,21 @@ def receraser_unlearning(original_model, data, args, device):
     return RecEraser(original_model, data, args, device).unlearn()
 
 
-def unranking_unlearning(original_model, data, args, device):
-    """
-    Performs preference revision via Unranking.
-    Unranking combines LPF p-hop scoping and preference factors with the
-    PAPU Hessian-scaled contextual demotion update.
-    """
-    logger.info("Starting preference revision via Unranking...")
-    return Unranking(original_model, data, args, device).unlearn()
+def unranking_revision(original_model, data, args, device):
+    """Preference revision with Unranking (LPF + PAPU)."""
+    logger.info("Starting preference revision via Unranking (LPF + PAPU)...")
+    return Unranking(original_model, data, args, device).revise()
 
 
-def raru_unlearning(original_model, data, args, device):
-    """Backward-compatible alias for older scripts."""
-    return unranking_unlearning(original_model, data, args, device)
+def postfilter_revision(original_model, data, args, device):
+    """Post-filtering reference point (output masking, model unchanged)."""
+    logger.info("Starting the Post-filtering reference point...")
+    return PostFiltering(original_model, data, args, device).unlearn()
+
+
+# Backward-compatible names for older experiment scripts.
+unranking_unlearning = unranking_revision
+postfilter_unlearning = postfilter_revision
 
 
 def ifru_unlearning(original_model, data, args, device):

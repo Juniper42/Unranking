@@ -42,6 +42,14 @@ class ModelCache:
             args.get("emb_dim", 0),
             args.get("batch_size", 0),
             args.get("num_layers", 0),
+            args.get("dropout_rate", 0.0),
+            args.get("weight_decay", 0.0),
+            args.get("reg_weight", 0.0),
+            args.get("neg_samples", 0),
+            args.get("loss_function", "bpr"),
+            args.get("split_method", "temporal"),
+            args.get("min_rating", 4.0),
+            args.get("core", 10),
         ]
         # Use a hash to keep the filename length manageable
         params_str = "-".join(map(str, params))
@@ -76,7 +84,7 @@ class ModelCache:
         if exists:
             logger.info(f"Found cached model: {cache_path}")
         else:
-            logger.info(f"No cached model found for the given parameters.")
+            logger.info("No cached model found for the given parameters.")
         return exists
 
     def save_model(self, model, args):
@@ -138,5 +146,8 @@ class ModelCache:
             f"Epochs: {args.get('epoch', 'N/A')}, "
             f"Embedding Dim: {args.get('emb_dim', 'N/A')}, "
             f"Batch Size: {args.get('batch_size', 'N/A')}, "
-            f"Layers: {args.get('num_layers', 'N/A')}"
+            f"Layers: {args.get('num_layers', 'N/A')}, "
+            f"Split: {args.get('split_method', 'N/A')}, "
+            f"Min rating: {args.get('min_rating', 'N/A')}, "
+            f"Core: {args.get('core', 'N/A')}"
         )

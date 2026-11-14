@@ -29,7 +29,7 @@ class WMF(BaseModel):
         weight1=0.5,
         lambda_user=0.01,
         lambda_item=0.01,
-        dropout_rate=0.5,
+        dropout_rate=0.0,
     ):
         super().__init__(num_users, num_items, emb_dim)
         self.weight1 = weight1

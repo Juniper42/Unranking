@@ -1,5 +1,6 @@
 import gc
 import os
+import random
 import sys
 import time
 from datetime import datetime
@@ -7,6 +8,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 from attack import MembershipInferenceAttack
 from data_loader import load_dataset, set_seed
@@ -20,178 +22,237 @@ from unlearning_func import (
     gferaser_unlearning,
     gsgcf_ru_unlearning,
     ifru_unlearning,
+    postfilter_revision,
     receraser_unlearning,
     retrain_unlearning,
     rrl_unlearning,
     sisa_unlearning,
     ultrare_unlearning,
-    unranking_unlearning,
+    unranking_revision,
     unlearnrec_unlearning,
 )
-from unlearning_metrics import evaluate_forgetting_effect
+from unlearning_metrics import evaluate_rdr
 from utils import get_model
 
 logger = Logger.get_logger("Main")
 
+_METHOD_DISPLAY = {
+    "retrain": "Retrain",
+    "postfilter": "Post-filtering",
+    "gsgcf-ru": "GSGCF-RU",
+    "receraser": "RecEraser",
+    "unranking": "Unranking",
+    "ifru": "IFRU",
+    "sisa": "SISA",
+    "certified_removal": "Certified Removal",
+    "ultrare": "UltraRE",
+    "rrl": "RRL",
+    "unlearnrec": "UnlearnRec",
+    "gferaser": "GFEraser",
+}
+
+# Methods that train/partition the retained set and therefore use D_r at
+# evaluation time.  Parameter-update methods keep the original graph.
+_RETAINED_GRAPH_METHODS = {
+    "retrain",
+    "sisa",
+    "receraser",
+    "ultrare",
+    "gsgcf-ru",
+    "rrl",
+    "unlearnrec",
+    "gferaser",
+}
+
+
+def _training_history(data):
+    """Return each user's training interactions in chronological order.
+
+    The paper constructs the outdated candidate pool C_u from the earliest
+    25% of a user's training interactions, so the history must be ordered by
+    timestamp.  If a cache predates the timestamp-aware loader, the stored
+    row order is used as a fallback.
+    """
+    ratings = getattr(data, "train_ratings", None)
+    if ratings is not None and not ratings.empty:
+        columns = ["user_idx", "item_idx"]
+        if "timestamp" in ratings.columns:
+            columns.append("timestamp")
+        history = ratings[columns].copy()
+    else:
+        edges = getattr(data, "train_edge_index_original", data.train_edge_index)
+        edges = edges[:, (edges[1] >= data.num_users)]
+        history = pd.DataFrame(
+            {
+                "user_idx": edges[0].detach().cpu().numpy(),
+                "item_idx": (edges[1] - data.num_users).detach().cpu().numpy(),
+            }
+        )
+
+    if "timestamp" not in history.columns:
+        history["timestamp"] = np.arange(len(history), dtype=np.int64)
+    history["timestamp"] = pd.to_numeric(
+        history["timestamp"], errors="coerce"
+    ).fillna(-1).astype("int64")
+    return history.sort_values(
+        ["user_idx", "timestamp"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def _build_target_set(data, args):
+    """Draw D_t from the outdated candidate pools C_u.
+
+    Interaction level: for every user, sample a revision-ratio fraction of
+    the user's interactions uniformly at random from the earliest 25% of the
+    training pool.  Entity level: select items and mark all of their
+    interactions that fall in the candidate pools, following Section 5.1.4.
+    """
+    task = str(args.get("revision_level", "interaction")).lower()
+    if task == "item":
+        task = "entity"
+    revision_ratio = float(args.get("revision_ratio", 0.1))
+    outdated_fraction = float(args.get("outdated_fraction", 0.25))
+    target_seed = int(args.get("target_seed", 42))
+
+    if revision_ratio <= 0:
+        return set(), set()
+    if not 0 < outdated_fraction <= 1:
+        raise ValueError("outdated_fraction must be in (0, 1].")
+
+    history = _training_history(data)
+    candidates = {}
+    full_lengths = {}
+    pool_items = set()
+    for user, group in history.groupby("user_idx", sort=False):
+        items = group["item_idx"].to_numpy()
+        full_lengths[int(user)] = len(items)
+        n_candidate = max(1, int(np.floor(outdated_fraction * len(items))))
+        n_candidate = min(n_candidate, len(items))
+        candidate_items = items[:n_candidate]
+        candidates[int(user)] = candidate_items
+        pool_items.update(int(item) for item in candidate_items)
+
+    target_pairs = set()
+    if task == "interaction":
+        for user, candidate_items in tqdm(candidates.items(), desc="Sampling D_t"):
+            # The fraction is defined over the user's training interactions,
+            # not over the candidate pool.
+            full_length = full_lengths[int(user)]
+            n_target = int(np.floor(revision_ratio * full_length + 0.5))
+            n_target = min(max(n_target, 0), len(candidate_items))
+            if n_target <= 0:
+                continue
+            rng = random.Random(target_seed + int(user))
+            chosen = rng.sample(range(len(candidate_items)), n_target)
+            for index in chosen:
+                target_pairs.add((int(user), int(candidate_items[index])))
+        selected_items = set()
+    elif task == "entity":
+        n_select = int(round(revision_ratio * data.num_items))
+        n_select = max(1, min(n_select, len(pool_items))) if pool_items else 0
+        rng = random.Random(target_seed + 1)
+        selected_items = set(
+            rng.sample(sorted(pool_items), n_select)
+        ) if n_select > 0 else set()
+        for user, candidate_items in candidates.items():
+            for item in candidate_items:
+                if int(item) in selected_items:
+                    target_pairs.add((int(user), int(item)))
+    else:
+        raise ValueError(
+            "revision_level must be 'interaction' or 'entity' "
+            "(the legacy name 'item' maps to 'entity')."
+        )
+
+    return target_pairs, selected_items
+
 
 def compute_edges_to_remove(data, args, device):
-    """
-    Computes the edges to be removed for the unlearning task.
+    """Build the target set D_t and the retained set D_r.
 
-    Args:
-        data: The data object, which includes graph structure and metadata.
-        args: Configuration arguments, containing unlearning_task, unlearning_ratio, etc.
-        device: The computation device (CPU or CUDA).
-
-    Returns:
-        The updated data object with attributes `edges_to_remove` and
-        `train_edge_index_after_remove` populated.
+    Returns the data object with ``target_edges`` (the paper's D_t),
+    ``edges_to_remove`` (backward-compatible alias), ``retained_edge_index``
+    (D_r), and ``train_edge_index_after_remove`` populated.
     """
     logger.info(
-        f"Computing edges to remove for unlearning task: {args['unlearning_task']}"
+        "Drawing the target set D_t from the outdated candidate pools "
+        "C_u (task=%s, revision_ratio=%.3f, outdated_fraction=%.2f).",
+        args.get("revision_level"),
+        float(args.get("revision_ratio", 0.1)),
+        float(args.get("outdated_fraction", 0.25)),
     )
 
-    train_interaction_data = data.train_edge_index
+    target_pairs, selected_items = _build_target_set(data, args)
 
-    if args["unlearning_task"] == "interaction":
-        # Interaction unlearning: Remove a portion of recent interactions for a subset of users.
-        # 1. Randomly select a subset of users.
-        num_users_to_unlearn = int(data.num_users * args["unlearning_ratio"])
-        users_to_unlearn = torch.randperm(data.num_users)[:num_users_to_unlearn].to(
-            device
+    if target_pairs:
+        pairs = sorted(target_pairs)
+        target_edges = torch.tensor(
+            [[u, i + data.num_users] for u, i in pairs],
+            dtype=torch.long,
+            device=device,
         )
-        logger.info(
-            f"Randomly selected {num_users_to_unlearn} users for interaction unlearning ({args['unlearning_ratio']*100:.1f}%)"
+    else:
+        target_edges = torch.empty((2, 0), dtype=torch.long, device=device)
+        logger.warning("The target set D_t is empty; no revision request is applied.")
+
+    num_items = data.num_items
+    target_keys = (
+        target_edges[0] * num_items + (target_edges[1] - data.num_users)
+        if target_edges.numel() > 0
+        else torch.empty(0, dtype=torch.long, device=device)
+    )
+
+    def _filter_edges(edge_index):
+        if edge_index.numel() == 0:
+            return edge_index
+        src, dst = edge_index[0], edge_index[1]
+        forward = (src >= 0) & (src < data.num_users) & (dst >= data.num_users)
+        canonical_user = torch.where(forward, src, dst)
+        canonical_item = torch.where(
+            forward, dst - data.num_users, src - data.num_users
         )
+        keys = canonical_user * num_items + canonical_item
+        keep = ~torch.isin(keys, target_keys)
+        return edge_index[:, keep]
 
-        # 2. For each selected user, identify interactions to unlearn.
-        interactions_to_remove_list = []
-        # Mask to keep track of edges to be kept.
-        mask = torch.ones(
-            train_interaction_data.size(1), dtype=torch.bool, device=device
-        )
-
-        interaction_ratio = args["unlearning_interaction_ratio"]
-        logger.info("Using random selection for interaction unlearning.")
-
-        # Process each user selected for unlearning.
-        for user_idx in users_to_unlearn.cpu().numpy():
-            # Get all interactions for the current user.
-            user_interactions_mask = train_interaction_data[0] == user_idx
-            user_interactions = train_interaction_data[:, user_interactions_mask]
-
-            if user_interactions.size(1) == 0:
-                continue  # Skip users with no interactions.
-
-            # Randomly select interactions to remove.
-            num_interactions_to_remove = max(
-                1, int(user_interactions.size(1) * interaction_ratio)
-            )
-            perm = torch.randperm(user_interactions.size(1), device=device)
-            interactions_indices = perm[:num_interactions_to_remove]
-            user_interactions_to_remove = user_interactions[:, interactions_indices]
-
-            # Add the interactions to the removal list.
-            if user_interactions_to_remove.size(1) > 0:
-                interactions_to_remove_list.append(user_interactions_to_remove)
-                # Update the global mask to mark interactions for removal.
-                for k in range(user_interactions_to_remove.size(1)):
-                    interaction_to_mark = user_interactions_to_remove[:, k].unsqueeze(1)
-                    # Forward edge match (u -> i)
-                    forward_matches = (
-                        train_interaction_data == interaction_to_mark
-                    ).all(dim=0)
-                    # Backward edge match (i -> u)
-                    reverse_matches = (
-                        train_interaction_data[0] == interaction_to_mark[1]
-                    ) & (train_interaction_data[1] == interaction_to_mark[0])
-                    # Remove both forward and backward edges.
-                    mask[forward_matches | reverse_matches] = False
-
-        # Concatenate all interactions to be removed.
-        if interactions_to_remove_list:
-            interactions_to_remove = torch.cat(interactions_to_remove_list, dim=1)
-        else:
-            interactions_to_remove = torch.zeros(
-                (2, 0), dtype=torch.long, device=device
-            )
-
-        # Update training edge index using the mask.
-        new_train_interaction_data = train_interaction_data[:, mask]
-
-        logger.info(
-            f"Removed {interactions_to_remove.size(1)} interactions for {num_users_to_unlearn} users."
-        )
-
-    elif args["unlearning_task"] == "item":
-        # Item unlearning: Randomly remove items and their associated interactions.
-        # 1. Randomly select items to remove.
-        num_items_to_remove = int(data.num_items * args["unlearning_ratio"])
-
-        # Item indices start after user indices.
-        items_to_remove = torch.randperm(data.num_items)[:num_items_to_remove].to(
-            device
-        )
-        # Adjust to get correct item node indices.
-        items_to_remove_adjusted = items_to_remove + data.num_users
-
-        # Store information about removed items.
-        data.removed_items = items_to_remove_adjusted
-
-        logger.info(
-            f"Randomly selected {num_items_to_remove} items for unlearning ({args['unlearning_ratio']*100:.1f}%)"
-        )
-
-        # 2. Find all interactions (both directions) related to these items.
-        # Reshape for broadcasting.
-        items_to_remove_set = items_to_remove_adjusted.view(-1, 1)
-        # Forward edges: item is the destination node.
-        mask1 = (train_interaction_data[1].view(1, -1) == items_to_remove_set).any(
-            dim=0
-        )
-        # Backward edges: item is the source node.
-        mask2 = (train_interaction_data[0].view(1, -1) == items_to_remove_set).any(
-            dim=0
-        )
-        mask = mask1 | mask2
-
-        # 3. Identify interactions to remove and update the training data.
-        interactions_to_remove = train_interaction_data[:, mask]
-        new_train_interaction_data = train_interaction_data[:, ~mask]
-
-        # Record the node unlearning type as 'item'.
-        data.node_type = "item"
-
-        logger.info(
-            f"Removed {interactions_to_remove.size(1)} interactions related to {num_items_to_remove} items."
-        )
-
-    # Update the data object.
-    data.edges_to_remove = interactions_to_remove
-    data.train_edge_index_after_remove = new_train_interaction_data
+    data.train_edge_index_after_remove = _filter_edges(data.train_edge_index)
+    data.train_edge_index_after_remove_original = _filter_edges(
+        getattr(data, "train_edge_index_original", data.train_edge_index)
+    )
 
     if hasattr(data, "train_ratings") and not data.train_ratings.empty:
-        removed_pairs = set()
-        item_lo = data.num_users
-        item_hi = data.num_users + data.num_items
-        for src, dst in interactions_to_remove.t().detach().cpu().tolist():
-            if 0 <= src < data.num_users and item_lo <= dst < item_hi:
-                removed_pairs.add((src, dst - data.num_users))
-            elif item_lo <= src < item_hi and 0 <= dst < data.num_users:
-                removed_pairs.add((dst, src - data.num_users))
+        ratings = data.train_ratings
+        keys = (
+            ratings["user_idx"].astype("int64") * num_items
+            + ratings["item_idx"].astype("int64")
+        )
+        keep = ~keys.isin(target_keys.detach().cpu().tolist())
+        data.train_ratings_after_remove = ratings[keep].copy()
+    else:
+        data.train_ratings_after_remove = getattr(data, "train_ratings", None)
 
-        if removed_pairs:
-            removed_keys = {u * data.num_items + i for u, i in removed_pairs}
-            row_keys = (
-                data.train_ratings["user_idx"] * data.num_items
-                + data.train_ratings["item_idx"]
-            )
-            data.train_ratings_after_remove = data.train_ratings[
-                ~row_keys.isin(removed_keys)
-            ].copy()
-        else:
-            data.train_ratings_after_remove = data.train_ratings.copy()
+    data.target_edges = target_edges
+    data.edges_to_remove = target_edges
+    data.target_pairs = target_pairs
+    data.retained_edge_index = data.train_edge_index_after_remove
+    data.pre_revision_edge_index = data.train_edge_index
+    data.removed_items = (
+        torch.tensor(sorted(selected_items), dtype=torch.long, device=device)
+        if selected_items
+        else torch.empty(0, dtype=torch.long, device=device)
+    )
 
+    num_total = (
+        data.train_edge_index_original.size(1)
+        if hasattr(data, "train_edge_index_original")
+        else data.train_edge_index.size(1)
+    )
+    logger.info(
+        "Target set statistics: |D_t|=%d, |D_r|=%d, revision ratio=%.4f.",
+        target_edges.size(1),
+        num_total - target_edges.size(1),
+        target_edges.size(1) / max(num_total, 1),
+    )
     return data
 
 
@@ -282,8 +343,8 @@ def run_single_experiment(args, run_id=1):
     device = setup_environment()
     start_time = time.time()
     
-    # Set different seed for each run to ensure randomness
-    run_seed = 42 + run_id - 1
+    # Set different seed for each run to ensure randomness.
+    run_seed = int(args.get("random_seed", 42)) + run_id - 1
     set_seed(run_seed)
     logger.info(f"Run {run_id} - Using random seed: {run_seed}")
 
@@ -296,8 +357,8 @@ def run_single_experiment(args, run_id=1):
         dataset_name,
         device,
         backbone=args["backbone"],
-        min_rating=3,
-        min_interactions=10,
+        min_rating=args["min_rating"],
+        core=args["core"],
         test_size=args["test_size"],
         val_size=args["val_size"],
         split_method=args["split_method"],
@@ -320,13 +381,15 @@ def run_single_experiment(args, run_id=1):
         f"{train_edges_cnt} training edges, {test_edges_cnt} test edges"
     )
     logger.info(
-        f"Average interactions per user: {data.edge_index.size(1) / data.num_users:.2f}"
+        f"Average interactions per user: {train_edges_cnt / data.num_users:.2f}"
     )
 
     # Build a dictionary of user's training items to filter seen items during evaluation
     logger.info("Building user-to-train-items dictionary for evaluation filtering...")
     user_train_items = get_user_train_items(
-        data.train_edge_index, data.num_users, data.num_items
+        getattr(data, "train_edge_index_original", data.train_edge_index),
+        data.num_users,
+        data.num_items,
     )
     logger.info(
         f"Successfully built user-to-train-items dictionary for {len(user_train_items)} users."
@@ -334,24 +397,18 @@ def run_single_experiment(args, run_id=1):
 
     # Initialize and train the original model
     logger.info("Training the original model...")
-    original_model = get_model(
-        args["backbone"],
-        data.num_users,
-        data.num_items,
-        emb_dim=args["emb_dim"],
-        num_layers=args["num_layers"],
-        dropout_rate=args["dropout_rate"],
-    ).to(device)
+    original_model = get_model(args, data.num_users, data.num_items).to(device)
 
-    # Set evaluation batch size based on dataset and available resources
-    if args["dataset"] == "ml-1m":
-        args["eval_batch_size"] = (
-            args["batch_size"] * 2 if torch.cuda.is_available() else 256
-        )
-    else:  # yelp2018, amazon-book
-        args["eval_batch_size"] = (
-            args["batch_size"] if torch.cuda.is_available() else 256
-        )
+    # Evaluation batch size.  Large datasets keep the batch moderate so the
+    # full-item score matrix remains within GPU memory.
+    if not torch.cuda.is_available():
+        args["eval_batch_size"] = 256
+    elif args["dataset"] == "ml-1m":
+        args["eval_batch_size"] = args["batch_size"] * 2
+    elif args["dataset"] in {"ml-10m", "netflix", "amazon-book"}:
+        args["eval_batch_size"] = min(args["batch_size"], 1024)
+    else:
+        args["eval_batch_size"] = args["batch_size"]
 
     # Train or load the original model from cache
     if args["use_model_cache"]:
@@ -387,7 +444,7 @@ def run_single_experiment(args, run_id=1):
             eval_interval=args["eval_interval"],
         )
 
-    logger.info("Original model evaluation results:")
+    logger.info("Pre-revision model M_p evaluation results on retained data:")
     print_metrics(
         evaluate_model(
             model=original_model,
@@ -399,7 +456,7 @@ def run_single_experiment(args, run_id=1):
             is_test=True,
             k=args["k"],
         ),
-        prefix="Before Unlearning",
+        prefix="Before Revision (M_p)",
     )
 
     # Compute edges to remove
@@ -407,76 +464,103 @@ def run_single_experiment(args, run_id=1):
 
     # Re-compute user-to-train-items dictionary after removal
     user_train_items = get_user_train_items(
-        data.train_edge_index_after_remove, data.num_users, data.num_items
+        getattr(
+            data,
+            "train_edge_index_after_remove_original",
+            data.train_edge_index_after_remove,
+        ),
+        data.num_users,
+        data.num_items,
     )
     logger.info(
         f"Successfully rebuilt user-to-train-items dictionary for {len(user_train_items)} users."
     )
 
-    # Perform unlearning based on the selected method
-    logger.info(f"Performing unlearning using method: {args['method']}")
-    unlearning_model, unlearning_time = None, 0.0
-    method_name = args["method"].capitalize()
+    # Perform revision with the selected method.
+    logger.info(f"Performing preference revision using method: {args['method']}")
+    revised_model, revision_time = None, 0.0
+    method_display = _METHOD_DISPLAY.get(args["method"], args["method"])
+    if args["method"] in {"gsgcf-ru", "rrl"} and args["backbone"] != "lightgcn":
+        raise ValueError(
+            f"{method_display} is tied to the LightGCN/BPR setting in the paper "
+            "and is reported only for --backbone lightgcn."
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
     if args["method"] == "retrain":
-        unlearning_model, _, unlearning_time = retrain_unlearning(
+        revised_model, _, revision_time = retrain_unlearning(
             original_model, data, args, device, user_train_items=user_train_items
         )
+    elif args["method"] == "postfilter":
+        revised_model, _, revision_time = postfilter_revision(
+            original_model, data, args, device
+        )
     elif args["method"] == "gsgcf-ru":
-        unlearning_model, _, unlearning_time = gsgcf_ru_unlearning(
+        revised_model, _, revision_time = gsgcf_ru_unlearning(
             original_model, data, args, device
         )
-        method_name = "GSGCF-RU"
     elif args["method"] == "receraser":
-        unlearning_model, _, unlearning_time = receraser_unlearning(
+        revised_model, _, revision_time = receraser_unlearning(
             original_model, data, args, device
         )
-    elif args["method"] in {"unranking", "raru"}:
-        unlearning_model, _, unlearning_time = unranking_unlearning(
+    elif args["method"] == "unranking":
+        revised_model, _, revision_time = unranking_revision(
             original_model, data, args, device
         )
-        method_name = "Unranking"
     elif args["method"] == "ifru":
-        unlearning_model, _, unlearning_time = ifru_unlearning(
+        revised_model, _, revision_time = ifru_unlearning(
             original_model, data, args, device
         )
     elif args["method"] == "sisa":
-        unlearning_model, _, unlearning_time = sisa_unlearning(
+        revised_model, _, revision_time = sisa_unlearning(
             original_model, data, args, device
         )
     elif args["method"] == "certified_removal":
-        unlearning_model, _, unlearning_time = certified_removal_unlearning(
+        revised_model, _, revision_time = certified_removal_unlearning(
             original_model, data, args, device
         )
-        method_name = "Certified Removal"
     elif args["method"] == "ultrare":
-        unlearning_model, _, unlearning_time = ultrare_unlearning(
+        revised_model, _, revision_time = ultrare_unlearning(
             original_model, data, args, device
         )
-        method_name = "UltraRE"
     elif args["method"] == "rrl":
-        unlearning_model, _, unlearning_time = rrl_unlearning(
+        revised_model, _, revision_time = rrl_unlearning(
             original_model, data, args, device
         )
-        method_name = "RRL"
     elif args["method"] == "unlearnrec":
-        unlearning_model, _, unlearning_time = unlearnrec_unlearning(
+        revised_model, _, revision_time = unlearnrec_unlearning(
             original_model, data, args, device
         )
-        method_name = "UnlearnRec"
     elif args["method"] == "gferaser":
-        unlearning_model, _, unlearning_time = gferaser_unlearning(
+        revised_model, _, revision_time = gferaser_unlearning(
             original_model, data, args, device
         )
-        method_name = "GFEraser"
     else:
-        raise ValueError(f"Unknown unlearning method: {args['method']}")
+        raise ValueError(f"Unknown preference-revision method: {args['method']}")
 
-    # Evaluate the unlearned model
-    logger.info(f"\nEvaluating the {method_name} model...")
+    # Each method is evaluated on the graph it actually uses: methods that
+    # retrain or partition the retained set use D_r, whereas parameter-update
+    # methods keep the original graph and change Theta only.
+    if args["method"] in _RETAINED_GRAPH_METHODS:
+        data.eval_edge_index = data.train_edge_index_after_remove
+    else:
+        data.eval_edge_index = data.train_edge_index
+
+    peak_memory_mb = (
+        torch.cuda.max_memory_allocated() / 1024**2
+        if torch.cuda.is_available()
+        else 0.0
+    )
+    time_memory_product = revision_time * peak_memory_mb / 1024.0  # GB*seconds
+
+    # Evaluate the revised model on retained data (NDCG@10).
+    logger.info(f"\nEvaluating the {method_display} model...")
     with torch.no_grad():
-        unlearning_model_result = evaluate_model(
-            unlearning_model,
+        revised_result = evaluate_model(
+            revised_model,
             data,
             args,
             device,
@@ -486,45 +570,44 @@ def run_single_experiment(args, run_id=1):
             k=args["k"],
         )
 
-    logger.info(f"\nEvaluation results for {method_name} after unlearning:")
-    print_metrics(unlearning_model_result, prefix=f"After {method_name}")
-    logger.info(f"\n{method_name} took {unlearning_time:.2f} seconds.")
+    logger.info(f"\nEvaluation results for {method_display} after revision:")
+    print_metrics(revised_result, prefix=f"After {method_display}")
+    logger.info(f"\n{method_display} took {revision_time:.2f} seconds.")
 
-    # Evaluate forgetting effect
-    forgetting_metrics = {}
-    if args["evaluate_forgetting"]:
-        logger.info(f"\nEvaluating forgetting effect of {method_name}...")
+    # Ranking-level analysis: Ranking Decrease Rate (RDR).
+    rdr_metrics = {}
+    if args["evaluate_rdr"]:
+        logger.info(f"\nEvaluating the Ranking Decrease Rate of {method_display}...")
         with torch.no_grad():
-            forgetting_metrics = evaluate_forgetting_effect(
-                original_model, unlearning_model, data, args, data.edges_to_remove
+            rdr_metrics = evaluate_rdr(
+                original_model, revised_model, data, args, data.target_edges
             )
     else:
-        logger.info("Forgetting effect evaluation is disabled.")
+        logger.info("RDR evaluation is disabled.")
 
-    # Perform Membership Inference Attack if enabled
+    # Distribution-level analysis: Revision Rate (RR) from the MIA probe.
     attack_results = None
     if args["is_attack"]:
         logger.info(
-            f"\nPerforming Membership Inference Attack on the model after {method_name}..."
+            f"\nRunning the MIA probe for {method_display} "
+            "(preference-imprint probe, not a privacy claim)..."
         )
         attack = MembershipInferenceAttack(
-            original_model, unlearning_model, data, device, args
+            original_model, revised_model, data, device, args
         )
-        attack_results = attack.run_attack(data.edges_to_remove)
+        attack_results = attack.run_attack(data.target_edges)
 
         if attack_results:
-            logger.info(
-                f"\nDetailed metrics for Membership Inference Attack against {method_name}:"
-            )
             logger.info("-" * 50)
+            logger.info("RR and MIA probe metrics for %s:", method_display)
             for key, value in attack_results.items():
-                if isinstance(value, (list, dict)):
-                    logger.info(f"{key}: {value}")
+                if isinstance(value, (int, float)) and value is not None:
+                    logger.info("  %s: %.4f", key, value)
                 else:
-                    logger.info(f"{key}: {value:.4f}")
+                    logger.info("  %s: %s", key, value)
             logger.info("-" * 50)
 
-    # Manually clear memory
+    # Manually clear memory.
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
@@ -532,29 +615,55 @@ def run_single_experiment(args, run_id=1):
     total_time = time.time() - start_time
     logger.info(f"\nTotal experiment run time: {total_time:.2f} seconds.")
 
-    # Build results dictionary
+    target_size = int(data.target_edges.size(1))
+    retained_size = int(
+        getattr(data, "train_edge_index_after_remove_original",
+                data.train_edge_index_after_remove).size(1)
+    )
+
     result = {
         "method": args["method"],
+        "method_display": method_display,
         "dataset": args["dataset"],
         "backbone": args["backbone"],
         "test_size": args["test_size"],
+        "val_size": args["val_size"],
         "split_method": args["split_method"],
+        "min_rating": args["min_rating"],
+        "core": args["core"],
         "lr": args["lr"],
         "epoch": args["epoch"],
         "batch_size": args["batch_size"],
         "emb_dim": args["emb_dim"],
         "num_layers": args["num_layers"],
+        "dropout_rate": args["dropout_rate"],
         "weight_decay": args["weight_decay"],
-        "unlearning_ratio": args["unlearning_ratio"],
-        "unlearning_interaction_ratio": args["unlearning_interaction_ratio"],
-        "unlearning_task": args["unlearning_task"],
+        "reg_weight": args["reg_weight"],
+        "revision_ratio": args["revision_ratio"],
+        "revision_level": args["revision_level"],
+        "outdated_fraction": args["outdated_fraction"],
+        "target_seed": args["target_seed"],
+        "target_size": target_size,
+        "retained_size": retained_size,
+        "target_ratio": target_size / max(target_size + retained_size, 1),
+        "eval_graph": (
+            "retained" if args["method"] in _RETAINED_GRAPH_METHODS else "original"
+        ),
         "influence_hops": args["influence_hops"],
         "unranking_hops": args.get("unranking_hops"),
         "unranking_cg_steps": args.get("unranking_cg_steps"),
         "unranking_damping_lambda": args.get("unranking_damping_lambda"),
+        "unranking_no_scoping": args.get("unranking_no_scoping"),
+        "unranking_no_preference_factor": args.get("unranking_no_preference_factor"),
+        "unranking_no_structural": args.get("unranking_no_structural"),
+        "unranking_no_semantic": args.get("unranking_no_semantic"),
+        "unranking_no_contextual_correction": args.get(
+            "unranking_no_contextual_correction"
+        ),
         "unranking_dp": args.get("unranking_dp"),
         "unranking_dp_epsilon": args.get("unranking_dp_epsilon"),
         "unranking_dp_delta": args.get("unranking_dp_delta"),
+        "unranking_dp_clip_norm": args.get("unranking_dp_clip_norm"),
         "iteration": args["iteration"],
         "damp": args["damp"],
         "scale": args["scale"],
@@ -563,31 +672,43 @@ def run_single_experiment(args, run_id=1):
         "score_weight": args["score_weight"],
         "high_impact_ratio": args["high_impact_ratio"],
         "k": args["k"],
-        "recall@k": unlearning_model_result["recall@k"],
-        "ndcg@k": unlearning_model_result["ndcg@k"],
-        "precision@k": unlearning_model_result["precision@k"],
-        "auc": unlearning_model_result["auc"],
-        "unlearning_time": unlearning_time,
+        "recall@k": revised_result["recall@k"],
+        "ndcg@k": revised_result["ndcg@k"],
+        "precision@k": revised_result["precision@k"],
+        "auc": revised_result["auc"],
+        "revision_time": revision_time,
+        "peak_memory_mb": peak_memory_mb,
+        "time_memory_product": time_memory_product,
         "total_time": total_time,
-        "URR": forgetting_metrics.get("URR", 0.0),
-        "RDR": forgetting_metrics.get("RDR", 0.0),
+        "RR": attack_results.get("RR") if attack_results else None,
+        "auroc_pre_revision": (
+            attack_results.get("auroc_pre_revision") if attack_results else None
+        ),
+        "auroc_post_revision": (
+            attack_results.get("auroc_post_revision") if attack_results else None
+        ),
+        "symmetric_auroc_pre_revision": (
+            attack_results.get("symmetric_auroc_pre_revision")
+            if attack_results
+            else None
+        ),
+        "symmetric_auroc_post_revision": (
+            attack_results.get("symmetric_auroc_post_revision")
+            if attack_results
+            else None
+        ),
+        "RDR": rdr_metrics.get("RDR", 0.0),
+        "rdr_targets": rdr_metrics.get("num_targets", 0),
         "attack_batch_size": args["attack_batch_size"],
         "attack_epochs": args["attack_epochs"],
         "attack_lr": args["attack_lr"],
-        "attack_accuracy": attack_results["accuracy"] if attack_results else None,
-        "attack_member_success_rate": (
-            attack_results["member_success_rate"] if attack_results else None
-        ),
-        "attack_false_positive_rate": (
-            attack_results["false_positive_rate"] if attack_results else None
-        ),
-        "attack_f1_score": attack_results["f1_score"] if attack_results else None,
-        "attack_auc": attack_results["auc"] if attack_results else None,
+        "attack_patience": args["attack_patience"],
+        "attack_accuracy": attack_results.get("accuracy") if attack_results else None,
+        "attack_f1_score": attack_results.get("f1_score") if attack_results else None,
+        "attack_auc": attack_results.get("auc") if attack_results else None,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    # Note: CSV saving will be handled in run_multiple_experiments function
-    
     return result
 
 
@@ -621,9 +742,11 @@ def run_multiple_experiments(args):
     
     # Metrics to average (numeric values only)
     numeric_metrics = [
-        "recall@k", "ndcg@k", "precision@k", "auc", "unlearning_time",
-        "total_time", "URR", "RDR", "attack_accuracy", "attack_member_success_rate",
-        "attack_false_positive_rate", "attack_f1_score", "attack_auc"
+        "recall@k", "ndcg@k", "precision@k", "auc",
+        "revision_time", "peak_memory_mb", "time_memory_product", "total_time",
+        "RR", "RDR", "attack_accuracy", "attack_f1_score", "attack_auc",
+        "auroc_pre_revision", "auroc_post_revision",
+        "symmetric_auroc_pre_revision", "symmetric_auroc_post_revision",
     ]
     
     avg_result = {}
@@ -688,7 +811,7 @@ if __name__ == "__main__":
     parser = Config.get_config()
     args = vars(parser.parse_args())
     logger.info("Command: " + " ".join(sys.argv))
-    logger.info(f"")
+    logger.info("")
     
     if args['num_runs'] > 1:
         run_multiple_experiments(args)

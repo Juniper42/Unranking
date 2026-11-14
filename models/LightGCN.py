@@ -40,7 +40,7 @@ class LightGCN(BaseModel):
     """
 
     def __init__(
-        self, num_users, num_items, emb_dim=64, num_layers=3, dropout_rate=0.2
+        self, num_users, num_items, emb_dim=64, num_layers=3, dropout_rate=0.0
     ):
         super().__init__(num_users, num_items, emb_dim)
         self.num_layers = num_layers

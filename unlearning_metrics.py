@@ -1,10 +1,5 @@
-import os
-
 import numpy as np
 import torch
-import torch.nn.functional as F
-from scipy import stats
-from tqdm import tqdm
 
 from logger import Logger
 from utils import determine_is_gnn
@@ -28,25 +23,14 @@ def _canonical_user_item_pairs(target_edges, num_users, num_items):
 def compute_scores_and_rankings(
     model, data, args, target_edges, device, batch_size=2048, graph_edge_index=None
 ):
-    """
-    Efficiently computes scores, probabilities, and rankings for target edges.
-    This function is optimized for performance by processing in batches and minimizing CPU-GPU transfers.
+    """Compute scores and full-ranking positions for the target interactions.
 
-    Args:
-        model: The recommendation model.
-        data: The data object.
-        args: Dictionary of arguments.
-        target_edges: The user-item pairs to evaluate.
-        device: The computation device.
-        batch_size: The batch size for processing.
-
-    Returns:
-        A tuple of (scores, rankings) dictionaries for the target edges.
+    The position ``r_M(u, i)`` is obtained by sorting all items in descending
+    order of the model score, as defined in Section 3 of the paper.
     """
     model.eval()
     num_users, num_items = data.num_users, data.num_items
 
-    # Get model embeddings
     is_gnn = determine_is_gnn(args.get("backbone"))
     backbone = str(args.get("backbone", "")).upper()
     is_neumf = backbone == "NEUMF" and not is_gnn
@@ -62,7 +46,6 @@ def compute_scores_and_rankings(
     else:
         user_emb, item_emb = model.get_embeddings()
 
-    # Create a mapping from user to their target items for efficient lookup
     user_to_items = {}
     for u, v in _canonical_user_item_pairs(target_edges, num_users, num_items):
         if 0 <= v < num_items:
@@ -72,14 +55,12 @@ def compute_scores_and_rankings(
     scores_dict = {u: {} for u in unique_users}
     rankings_dict = {u: {} for u in unique_users}
 
-    # Process users in batches
     for i in range(0, len(unique_users), batch_size):
         batch_user_ids = unique_users[i : i + batch_size]
         batch_user_indices = torch.tensor(
             batch_user_ids, dtype=torch.long, device=device
         )
 
-        # Compute scores for all items for the batch of users.
         if is_neumf:
             item_indices = torch.arange(num_items, device=device)
             users_expanded = batch_user_indices.view(-1, 1).expand(-1, num_items)
@@ -90,158 +71,98 @@ def compute_scores_and_rankings(
         else:
             batch_scores = torch.matmul(user_emb[batch_user_indices], item_emb.t())
 
-        # Compute rankings on the GPU
-        # `argsort` twice is a common trick to get ranks: first sorts scores, second gives ranks
         batch_rankings = (
             torch.argsort(torch.argsort(batch_scores, dim=1, descending=True), dim=1)
             + 1
         )
 
-        # Move results to CPU for dictionary population
         batch_scores_cpu = batch_scores.cpu().numpy()
         batch_rankings_cpu = batch_rankings.cpu().numpy()
 
         for j, user_id in enumerate(batch_user_ids):
-            target_item_ids = user_to_items[user_id]
-            for item_id in target_item_ids:
+            for item_id in user_to_items[user_id]:
                 scores_dict[user_id][item_id] = batch_scores_cpu[j, item_id]
                 rankings_dict[user_id][item_id] = batch_rankings_cpu[j, item_id]
 
     return scores_dict, rankings_dict
 
 
-def calculate_ranking_change(original_rankings, unlearned_rankings, target_edges, data):
-    """
-    Calculates metrics related to changes in item rankings after unlearning.
+def calculate_ranking_decrease_rate(
+    original_rankings, revised_rankings, target_edges, data
+):
+    """Compute the Ranking Decrease Rate (RDR) of Eq. 3.
 
-    Returns avg_rank_change, rank_decline_ratio, URR, and RDR (Ranking Decrease Rate,
-    defined in the Unranking paper as the mean rank shift of target items:
-    RDR = (1 / |D_t|) * sum_{(u,i) in D_t} (r_{M'}(u,i) - r_M(u,i)).
-    Higher RDR means stronger demotion of target items, which is better for
-    rank-aware unlearning.
+    ``RDR = (1 / |D_t|) sum_{(u,i) in D_t} (r_M'(u,i) - r_Mp(u,i))``.
+
+    A positive value means that the target interactions were demoted on
+    average; ``0`` means that the scores are unchanged.
     """
     rank_changes = []
-    urr_terms = []
-
     for user_id, item_id in _canonical_user_item_pairs(
         target_edges, data.num_users, data.num_items
     ):
-
-        if user_id in original_rankings and user_id in unlearned_rankings:
+        if user_id in original_rankings and user_id in revised_rankings:
             if (
                 item_id in original_rankings[user_id]
-                and item_id in unlearned_rankings[user_id]
+                and item_id in revised_rankings[user_id]
             ):
-                orig_rank = original_rankings[user_id][item_id]
-                unlearn_rank = unlearned_rankings[user_id][item_id]
-
-                # Rank change: positive means rank decreased (good for unlearning)
-                rank_change = unlearn_rank - orig_rank
-                rank_changes.append(rank_change)
-
-                # Unlearning Rank Rate (URR) term
-                urr_terms.append(rank_change / (orig_rank + 1))
+                rank_changes.append(
+                    revised_rankings[user_id][item_id]
+                    - original_rankings[user_id][item_id]
+                )
 
     if not rank_changes:
-        return {"avg_rank_change": 0.0, "rank_decline_ratio": 0.0,
-                "URR": 0.0, "RDR": 0.0}
+        return {"RDR": 0.0, "num_targets": 0}
 
-    rank_changes = np.array(rank_changes)
-    urr_terms = np.array(urr_terms)
-
-    # RDR (Ranking Decrease Rate in the Unranking paper) is the
-    # un-filtered mean rank shift of target items.
-    rdr = float(np.mean(rank_changes))
-
-    # Filter out extreme outliers using the Interquartile Range (IQR) method
-    q1, q3 = np.percentile(rank_changes, [25, 75])
-    iqr = q3 - q1
-    lower_bound = q1 - 1.5 * iqr
-    upper_bound = q3 + 1.5 * iqr
-
-    valid_indices = (rank_changes >= lower_bound) & (rank_changes <= upper_bound)
-
-    rank_changes_filtered = rank_changes[valid_indices]
-    urr_terms_filtered = urr_terms[valid_indices]
-
-    if rank_changes_filtered.size > 0:
-        avg_rank_change = np.mean(rank_changes_filtered)
-        # Proportion of items whose rank decreased (moved further down the list)
-        rank_decline_ratio = np.mean(rank_changes_filtered > 0)
-        urr = np.mean(urr_terms_filtered) * rank_decline_ratio
-    else:
-        avg_rank_change, rank_decline_ratio, urr = 0.0, 0.0, 0.0
-
+    rank_changes = np.asarray(rank_changes, dtype=np.float64)
     return {
-        "avg_rank_change": avg_rank_change,
-        "rank_decline_ratio": rank_decline_ratio,
-        "URR": urr,
-        "RDR": rdr,
+        "RDR": float(rank_changes.mean()),
+        "num_targets": int(rank_changes.size),
     }
 
 
-def evaluate_forgetting_effect(
-    original_model, unlearned_model, data, args, target_edges
-):
-    """
-    Evaluates the effectiveness of the unlearning process by comparing model outputs
-    before and after unlearning.
-
-    Args:
-        original_model: The model before unlearning.
-        unlearned_model: The model after unlearning.
-        data: The data object.
-        args: Dictionary of arguments.
-        target_edges: The edges that were forgotten.
-
-    Returns:
-        A dictionary of forgetting metrics.
-    """
+def evaluate_rdr(original_model, revised_model, data, args, target_edges):
+    """Evaluate the Ranking Decrease Rate before and after revision."""
     device = next(original_model.parameters()).device
-    logger.info("Evaluating unlearning effectiveness...")
+    logger.info("Evaluating the Ranking Decrease Rate (RDR)...")
 
-    # Compute scores and rankings for the original model
     _, original_rankings = compute_scores_and_rankings(
         original_model,
         data,
         args,
         target_edges,
         device,
-        graph_edge_index=data.train_edge_index,
+        graph_edge_index=getattr(data, "pre_revision_edge_index", data.train_edge_index),
     )
-
-    # Compute scores and rankings for the unlearned model
-    _, unlearned_rankings = compute_scores_and_rankings(
-        unlearned_model,
+    _, revised_rankings = compute_scores_and_rankings(
+        revised_model,
         data,
         args,
         target_edges,
         device,
-        graph_edge_index=getattr(data, "train_edge_index_after_remove", data.train_edge_index),
+        graph_edge_index=getattr(
+            data,
+            "eval_edge_index",
+            getattr(data, "train_edge_index_after_remove", data.train_edge_index),
+        ),
     )
 
-    # Calculate metrics based on the changes
-    metrics = calculate_ranking_change(
-        original_rankings, unlearned_rankings, target_edges, data
+    metrics = calculate_ranking_decrease_rate(
+        original_rankings, revised_rankings, target_edges, data
     )
-
-    print_forgetting_metrics(metrics)
+    print_rdr_metrics(metrics)
     return metrics
 
 
-def print_forgetting_metrics(metrics):
-    """Prints the forgetting evaluation metrics in a formatted way."""
-    logger.info("\n--- Forgetting Evaluation Metrics ---")
+# Backward-compatible name for older scripts.
+evaluate_forgetting_effect = evaluate_rdr
+
+
+def print_rdr_metrics(metrics):
+    logger.info("\n--- Ranking-level Revision Metrics ---")
     logger.info(
-        f"  Avg. Rank Change:   {metrics.get('avg_rank_change', 0.0):.4f} (Higher is better)"
+        "  RDR (Ranking Decrease Rate): %.4f (Higher is better)",
+        metrics.get("RDR", 0.0),
     )
-    logger.info(
-        f"  Rank Decline Ratio: {metrics.get('rank_decline_ratio', 0.0):.4f} (Higher is better)"
-    )
-    logger.info(
-        f"  URR (Unlearning Rank Rate): {metrics.get('URR', 0.0):.4f} (Higher is better)"
-    )
-    logger.info(
-        f"  RDR (Ranking Decrease Rate): {metrics.get('RDR', 0.0):.4f} (Higher is better)"
-    )
-    logger.info("-----------------------------------\n")
+    logger.info("  Targets evaluated: %d", metrics.get("num_targets", 0))
+    logger.info("--------------------------------------\n")
