@@ -68,6 +68,34 @@ def evaluate_model(
     is_gnn_model = determine_is_gnn(backbone)
     is_neumf = backbone == "NEUMF" and not is_gnn_model
 
+    # Post-filtering leaves the model unchanged but masks outdated items in
+    # the output list (paper Section 5.1.3).  Interaction-level targets are
+    # masked per affected user so that one outdated interaction does not
+    # remove the item globally; entity-level targets are whole outdated items
+    # and are masked for every user.  RDR is computed separately on the full,
+    # unmasked ranking, matching Section 3's rank definition.
+    postfilter_global_items = None
+    postfilter_users = None
+    postfilter_items = None
+    if str(args.get("method", "")).lower() == "postfilter":
+        target_edges = getattr(data, "target_edges", None)
+        if target_edges is not None and target_edges.numel() > 0:
+            edges = target_edges.to(device)
+            items = edges[1] - data.num_users
+            valid = (items >= 0) & (items < data.num_items)
+            if bool(valid.any()):
+                level = str(args.get("revision_level", "interaction")).lower()
+                if level in {"entity", "item"}:
+                    # Entity-level targets are whole items, so mask them for
+                    # every user, not only for the users in the candidate pool.
+                    postfilter_global_items = torch.unique(items[valid])
+                else:
+                    users = edges[0][valid]
+                    items = items[valid]
+                    order = torch.argsort(users)
+                    postfilter_users = users[order]
+                    postfilter_items = items[order]
+
     if is_gnn_model:
         graph_edge_index = getattr(
             data,
@@ -138,6 +166,26 @@ def evaluate_model(
             if seen is not None and seen.numel() > 0:
                 scores_batch[row, seen] = float("-inf")
 
+        # Post-filtering masks the outdated items of each affected user.
+        if postfilter_global_items is not None and postfilter_global_items.numel() > 0:
+            scores_batch[:, postfilter_global_items] = float("-inf")
+        if postfilter_users is not None:
+            lo = int(torch.searchsorted(postfilter_users, batch_user_ids.min().item()))
+            hi = int(
+                torch.searchsorted(postfilter_users, batch_user_ids.max().item() + 1)
+            )
+            users_in_range = postfilter_users[lo:hi]
+            items_in_range = postfilter_items[lo:hi]
+            if users_in_range.numel() > 0:
+                sorted_batch, _ = torch.sort(batch_user_ids)
+                positions = torch.searchsorted(sorted_batch, users_in_range)
+                hit = (positions < sorted_batch.numel()) & (
+                    sorted_batch[positions.clamp(max=sorted_batch.numel() - 1)]
+                    == users_in_range
+                )
+                if bool(hit.any()):
+                    scores_batch[positions[hit], items_in_range[hit]] = float("-inf")
+
         _, topk_indices = torch.topk(scores_batch, k=k, dim=1)
         
         # Vectorized metrics calculation
@@ -191,6 +239,19 @@ def evaluate_model(
             if seen is not None and seen.numel() > 0:
                 all_neg_items[seen] = False
             all_neg_items[pos_items] = False
+            if postfilter_global_items is not None and postfilter_global_items.numel() > 0:
+                all_neg_items[postfilter_global_items] = False
+            if postfilter_users is not None:
+                uid = user_id.item()
+                lo = int(torch.searchsorted(postfilter_users, torch.tensor(uid, device=device)))
+                hi = int(
+                    torch.searchsorted(
+                        postfilter_users, torch.tensor(uid + 1, device=device)
+                    )
+                )
+                items = postfilter_items[lo:hi]
+                if items.numel() > 0:
+                    all_neg_items[items] = False
             neg_scores = user_scores[all_neg_items]
             
             if len(pos_scores) > 0 and len(neg_scores) > 0:

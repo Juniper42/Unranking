@@ -12,8 +12,9 @@ class PostFiltering:
     The model is left untouched and the outdated items are masked only in the
     output recommendation list, following the reference point in Section 5.1.3
     of the paper.  This isolates the contribution of parameter-level revision:
-    ``RR = 1`` and ``RDR = 0`` because the scoring model and its parameters are
-    unchanged.
+    ``RR = 1`` because the scoring model and its parameters are unchanged;
+    ``RDR = 0`` because the paper's rank statistic is defined on the full,
+    unmasked ranking (Section 3).
     """
 
     def __init__(self, model, data, args, device):

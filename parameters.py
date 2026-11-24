@@ -306,10 +306,11 @@ class Config:
         parser.add_argument(
             "--attack_max_pairs",
             type=int,
-            default=10000,
+            default=0,
             help=(
-                "Optional cap on the number of target pairs used by the MIA "
-                "probe. 0 disables the cap."
+                "Number of target pairs used by the MIA probe. 0 uses all "
+                "pairs, as in the paper; set a positive value only as a "
+                "runtime safeguard."
             ),
         )
         parser.add_argument(

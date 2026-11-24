@@ -1,20 +1,7 @@
 # Fast Unranking for Preference Revision in Recommendation
 
-This repository contains the code for the paper **“Fast Unranking for
-Preference Revision in Recommendation”** (TOIS submission).
-
-Unranking is a ranking-aware recommendation unlearning framework for
-efficient preference revision.  It reduces the influence of interactions that
-no longer reflect a user's current preference while preserving retained
-recommendation quality.  The framework has two components:
-
-- **Localized Preference Factor (LPF)**: builds a compact `p`-hop influence
-  scope `D_inf` around the target set `D_t` and assigns a preference factor
-  `omega(v)` to each entity using structural and semantic signals.
-- **Preference-Aware Parameter Update (PAPU)**: builds the aggregated
-  demotion gradient `g` and solves
-  `(H_inf + lambda I) DeltaTheta = g` with Conjugate Gradient and
-  Hessian-vector products, producing `Theta' = Theta + DeltaTheta`.
+## Abstract
+Historical interactions can continue to shape recommendations even after the user preferences they reflect have become outdated. Recommendation unlearning provides a practical way to support preference revision by removing the influence of outdated interactions from the trained model. Existing methods typically aim to make the unlearned model behave like one retrained from scratch. However, preference revision requires the model to reflect changes in user preferences while preserving recommendation quality and update efficiency. To address this gap, we propose **Unranking**, a recommendation unlearning framework that revises outdated preferences through targeted ranking updates. Unranking consists of a *Localized Preference Factor* (LPF) and a *Preference-Aware Parameter Update* (PAPU). LPF defines a compact influence scope and assigns a preference factor to each entity in the scope using structural and semantic signals. PAPU uses these factors to demote the target and related items while maintaining recommendation quality on retained interactions. Across five datasets with up to 100 million interactions and three recommendation backbones, Unranking achieves the best retained recommendation quality among unlearning methods in most settings while maintaining high revision effectiveness. It is also the fastest unlearning method in every setting, with a geometric mean speedup of $61\times$ over the unlearning baselines. 
 
 ## Code Structure
 
@@ -56,21 +43,6 @@ pip install -r requirements.txt
 ```
 
 ## Data
-
-Experiments use five datasets: **MovieLens-1M**, **Yelp2018**,
-**Amazon-Book**, **MovieLens-10M**, and **Netflix**.  The loader applies the
-protocol in Section 5.1.4:
-
-1. ratings of 4 or higher are kept as implicit positives (for files that
-   contain ratings);
-2. an iterative **10-core** filter is applied to users and items;
-3. each user's interactions are split chronologically into 80% training,
-   10% validation, and 10% test;
-4. the earliest 25% of each user's training interactions form the outdated
-   candidate pool `C_u`; a revision-ratio fraction is drawn uniformly at
-   random from `C_u` under a fixed seed to form `D_t`.
-
-Expected data layout (one directory per dataset):
 
 ```
 data/
@@ -131,44 +103,3 @@ recommended in Section 5.2.2.  The paper searches `p` in `{0,1,2,3,4}` and
 `gsgcf-ru` and `rrl` are tied to the LightGCN/BPR setting and are reported only
 for `--backbone lightgcn`, as in the paper.  The paper evaluates the
 LightGCN, WMF, and NeuMF backbones.
-
-## Evaluation
-
-- **Retained recommendation quality**: NDCG@10 (also Recall@k, Precision@k,
-  and HR@k) on the retained test interactions.
-- **Revision effectiveness**:
-  - **Revision Rate (RR)**: ratio of the membership-inference AUC before
-    revision (pre-revision model `M_p`) to that after revision (revised model
-    `M'`), using the symmetric AUC `max(AUC, 1 - AUC)`.  Each MIA-AUC is
-    computed from an MIA probe trained on `M_p` outputs and frozen for `M'`.
-  - **Ranking Decrease Rate (RDR)**: mean rank change of `D_t` on the full
-    ranking, `RDR = mean(r_M'(u,i) - r_Mp(u,i))`.
-- **Revision efficiency**: wall-clock revision time (`Time`) and peak GPU
-  memory (`Memory`); the code also reports `time x memory`.
-
-The MIA probe follows Section 5.1.6: members are `D_t`; non-members are
-validation/test interactions of the same users matched by item-popularity
-group on the retained training data; pairs are split 6:2:2; the probe is a
-three-layer MLP with hidden dimensions 64 and 32, trained with BCE and Adam
-(`lr = 1e-3`, batch size 256, up to 100 epochs, early stopping after 10 epochs
-without validation-AUROC improvement).  RR is a probe for the residual
-preference imprint, not a privacy claim.  `--attack_max_pairs` caps the number
-of probe pairs for tractability (default 10000; the paper does not specify a
-cap).
-
-## Ablations
-
-The flags in Table 6 of the paper are available directly:
-
-```bash
---unranking_no_scoping                 # w/o Scoping
---unranking_no_preference_factor       # w/o Preference Factor
---unranking_no_structural              # w/o Structural
---unranking_no_semantic                # w/o Semantic
---unranking_no_contextual_correction   # w/o Contextual Corr.
---unranking_dp                         # Unranking (+ Noise)
-```
-
-The optional noise variant clips `DeltaTheta` to norm `C'`
-(`--unranking_dp_clip_norm`) and adds
-`N(0, 2 C'^2 ln(1.25/delta) / epsilon^2 I)`; it is off by default.

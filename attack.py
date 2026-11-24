@@ -55,7 +55,7 @@ class MembershipInferenceAttack:
         self.attack_epochs = int(args.get("attack_epochs", 100))
         self.attack_lr = float(args.get("attack_lr", 1e-3))
         self.attack_patience = int(args.get("attack_patience", 10))
-        self.max_pairs = int(args.get("attack_max_pairs", 10000))
+        self.max_pairs = int(args.get("attack_max_pairs", 0))
         self.popularity_bins = int(args.get("mia_popularity_bins", 10))
 
         self.probe = None
@@ -134,7 +134,7 @@ class MembershipInferenceAttack:
             members = rng.sample(members, self.max_pairs)
             logger.info(
                 "Capped MIA members to %d interactions for tractability "
-                "(runtime safeguard; the paper does not specify a cap).",
+                "(explicit runtime safeguard; the paper uses all pairs).",
                 len(members),
             )
 

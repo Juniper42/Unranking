@@ -175,12 +175,6 @@ class Unranking:
         """Return ``D_t`` as canonical forward user--item edges."""
         return self._canonical_edge_tensor(self.data.edges_to_remove, deduplicate=True)
 
-    def _scope_graph(self, scope_edges):
-        """Build the bidirectional graph used by GNN message passing."""
-        if scope_edges.numel() == 0:
-            return self._empty_edges()
-        return torch.cat([scope_edges, scope_edges.flip(0)], dim=1)
-
     def _forward_embeddings(self, graph_edge_index=None):
         if self.is_gnn:
             if graph_edge_index is None:
@@ -460,11 +454,18 @@ class Unranking:
             return torch.sum(user_emb[users] * item_emb[items], dim=1)
         return self.model(user_indices=users, item_indices=items)
 
-    def _positive_loss(self, edges, weights=None, graph_edge_index=None):
+    def _positive_loss(
+        self, edges, weights=None, graph_edge_index=None, neg_items=None
+    ):
         """Interaction loss on an edge set.
 
         ``L(D; Theta)`` is used in its interaction-summed form, so ``g`` and
         ``H_inf`` share the same scale in the linear system of Eq. 13.
+
+        ``neg_items`` optionally supplies one negative item per edge.  The
+        caller reuses the same negatives for ``g`` and ``H_inf`` so that both
+        are derivatives of one BPR loss realisation (Eq. 12--13), instead of
+        three independently resampled losses.
         """
         if edges.numel() == 0:
             return self._zero_loss()
@@ -472,9 +473,12 @@ class Unranking:
         users = edges[0]
         pos_items = edges[1] - self.num_users
         if self._uses_bpr_loss():
-            neg_items = torch.randint(
-                0, self.num_items, (users.size(0),), device=self.device
-            )
+            if neg_items is None:
+                neg_items = torch.randint(
+                    0, self.num_items, (users.size(0),), device=self.device
+                )
+            else:
+                neg_items = neg_items.to(self.device)
             if self.is_gnn:
                 user_emb, item_emb = self._forward_embeddings(graph_edge_index)
                 pos_scores = torch.sum(user_emb[users] * item_emb[pos_items], dim=1)
@@ -595,11 +599,45 @@ class Unranking:
             logger.warning("Target set D_t is empty; returning the model unchanged.")
             return copy.deepcopy(self.model), target_edges, elapsed
 
+        # Split D_inf into D_t and D_inf \ D_t in the scope's own edge order,
+        # so the same per-edge BPR negative can be reused by every loss term.
+        scope_keys = scope_edges[0] * self.num_items + (
+            scope_edges[1] - self.num_users
+        )
+        target_keys = target_edges[0] * self.num_items + (
+            target_edges[1] - self.num_users
+        )
+        target_mask = torch.isin(scope_keys, target_keys)
+        if int(target_mask.sum().item()) != target_edges.size(1):
+            logger.warning(
+                "Some target interactions are not present in the influence "
+                "scope; they are excluded from g and H_inf."
+            )
+        target_edges_in_scope = scope_edges[:, target_mask]
+        related_edges_in_scope = scope_edges[:, ~target_mask]
+
+        # One BPR negative per scope edge, reused by g and H_inf.
+        use_bpr = self._uses_bpr_loss()
+        scope_neg = (
+            torch.randint(
+                0, self.num_items, (scope_edges.size(1),), device=self.device
+            )
+            if use_bpr
+            else None
+        )
+        target_neg = scope_neg[target_mask] if scope_neg is not None else None
+        related_neg = scope_neg[~target_mask] if scope_neg is not None else None
+
         # Stage 2: preference factor estimation.
         preference = self._compute_preference_factors(scope_edges, target_edges)
         related_weights = None
-        if not self.no_contextual_correction and related_edges.numel() > 0:
-            related_weights = self._interaction_weights(related_edges, preference)
+        if (
+            not self.no_contextual_correction
+            and related_edges_in_scope.numel() > 0
+        ):
+            related_weights = self._interaction_weights(
+                related_edges_in_scope, preference
+            )
         logger.info(
             "Stage 2/3 - preference factors: |V_inf|=%d, "
             "mean omega=%.4f, max omega=%.4f",
@@ -608,25 +646,28 @@ class Unranking:
             max(preference.values()) if preference else 0.0,
         )
 
-        scope_graph = self._scope_graph(scope_edges)
-
-        # Aggregated demotion gradient g of Eq. 12.
-        target_loss = self._positive_loss(target_edges, graph_edge_index=scope_graph)
+        # Eq. (12)--(13) restrict the *interaction set* of the loss to D_t /
+        # D_inf, not the GNN forward graph: Theta parameterises the full-graph
+        # model M_p.  graph_edge_index=None => _forward_embeddings() uses
+        # data.train_edge_index, the same graph used for evaluation.
+        target_loss = self._positive_loss(
+            target_edges_in_scope, neg_items=target_neg
+        )
         if related_weights is None:
             total_grad_loss = target_loss
         else:
             context_loss = self._positive_loss(
-                related_edges,
+                related_edges_in_scope,
                 weights=related_weights,
-                graph_edge_index=scope_graph,
+                neg_items=related_neg,
             )
             total_grad_loss = target_loss + context_loss
 
         self.model.zero_grad(set_to_none=True)
         g_total = self._flat_grad(total_grad_loss, create_graph=False)
 
-        # Hessian restricted to the localized scope, H_inf.
-        hessian_loss = self._positive_loss(scope_edges, graph_edge_index=scope_graph)
+        # Hessian restricted to the D_inf interactions, H_inf.
+        hessian_loss = self._positive_loss(scope_edges, neg_items=scope_neg)
         loss_grads_inf = self._flat_grad(hessian_loss, create_graph=True)
 
         def hvp_local(vector):
